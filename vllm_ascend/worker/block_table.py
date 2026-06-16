@@ -1,3 +1,5 @@
+import contextlib
+
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
@@ -143,6 +145,14 @@ class BlockTable:
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        self.dump_slot_mapping_inputs(
+            num_reqs,
+            num_tokens,
+            query_start_loc,
+            positions,
+            total_cp_world_size,
+            total_cp_rank,
+        )
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
@@ -156,8 +166,127 @@ class BlockTable:
             TOTAL_CP_RANK=total_cp_rank,
             CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
             PAD_ID=PAD_SLOT_ID,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=128,
         )
+
+    def dump_slot_mapping_inputs(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        total_cp_world_size: int,
+        total_cp_rank: int,
+    ) -> None:
+        import os
+        import time
+
+        import torch
+
+        # 不想 dump 时就不执行
+        if os.environ.get("DUMP_SLOT_MAPPING", "0") != "1":
+            return
+
+        with contextlib.suppress(Exception):
+            torch.npu.synchronize()
+
+        pid = os.getpid()
+        rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "unknown"))
+        dump_dir = "/tmp/slot_mapping_dump"
+        os.makedirs(dump_dir, exist_ok=True)
+
+        block_table = self.block_table.gpu
+        slot_mapping = self.slot_mapping.gpu
+
+        print("========== dump slot_mapping inputs ==========", flush=True)
+        print(f"pid={pid}, rank={rank}", flush=True)
+        print(f"num_reqs={num_reqs}", flush=True)
+        print(f"num_tokens={num_tokens}", flush=True)
+        print(f"max_num_batched_tokens={self.max_num_batched_tokens}", flush=True)
+        print(f"block_size={self.block_size}", flush=True)
+        print(f"block_table_stride={block_table.stride(0)}", flush=True)
+        print(f"pcp_world_size={self.pcp_world_size}", flush=True)
+        print(f"dcp_world_size={self.dcp_world_size}", flush=True)
+        print(f"pcp_rank={self.pcp_rank}", flush=True)
+        print(f"dcp_rank={self.dcp_rank}", flush=True)
+        print(f"total_cp_world_size={total_cp_world_size}", flush=True)
+        print(f"total_cp_rank={total_cp_rank}", flush=True)
+        print(f"cp_kv_cache_interleave_size={self.cp_kv_cache_interleave_size}", flush=True)
+        print(f"PAD_SLOT_ID={PAD_SLOT_ID}", flush=True)
+
+        print(
+            f"query_start_loc: shape={tuple(query_start_loc.shape)}, "
+            f"dtype={query_start_loc.dtype}, device={query_start_loc.device}, "
+            f"stride={query_start_loc.stride()}",
+            flush=True,
+        )
+        print(
+            f"positions: shape={tuple(positions.shape)}, "
+            f"dtype={positions.dtype}, device={positions.device}, "
+            f"stride={positions.stride()}",
+            flush=True,
+        )
+        print(
+            f"block_table: shape={tuple(block_table.shape)}, "
+            f"dtype={block_table.dtype}, device={block_table.device}, "
+            f"stride={block_table.stride()}",
+            flush=True,
+        )
+        print(
+            f"slot_mapping: shape={tuple(slot_mapping.shape)}, "
+            f"dtype={slot_mapping.dtype}, device={slot_mapping.device}, "
+            f"stride={slot_mapping.stride()}",
+            flush=True,
+        )
+
+        q_cpu = query_start_loc.detach().cpu()
+        p_cpu = positions.detach().cpu()
+        bt_cpu = block_table.detach().cpu()
+        sm_cpu = slot_mapping.detach().cpu()
+
+        print("query_start_loc values:", q_cpu.tolist(), flush=True)
+        print("positions first 64:", p_cpu[:64].tolist(), flush=True)
+        print("positions last 64:", p_cpu[-64:].tolist(), flush=True)
+
+        if bt_cpu.dim() == 2:
+            print("block_table[0, :64]:", bt_cpu[0, :64].tolist(), flush=True)
+        else:
+            print("block_table first 64:", bt_cpu.flatten()[:64].tolist(), flush=True)
+
+        print("slot_mapping before first 64:", sm_cpu[:64].tolist(), flush=True)
+
+        path = (
+            f"{dump_dir}/slot_mapping_"
+            f"pid{pid}_rank{rank}_"
+            f"req{num_reqs}_tok{num_tokens}_"
+            f"{time.strftime('%Y%m%d_%H%M%S')}.pt"
+        )
+
+        torch.save(
+            {
+                "num_reqs": num_reqs,
+                "num_tokens": num_tokens,
+                "max_num_batched_tokens": self.max_num_batched_tokens,
+                "block_size": self.block_size,
+                "block_table_stride": block_table.stride(0),
+                "pcp_world_size": self.pcp_world_size,
+                "dcp_world_size": self.dcp_world_size,
+                "pcp_rank": self.pcp_rank,
+                "dcp_rank": self.dcp_rank,
+                "total_cp_world_size": total_cp_world_size,
+                "total_cp_rank": total_cp_rank,
+                "cp_kv_cache_interleave_size": self.cp_kv_cache_interleave_size,
+                "pad_slot_id": PAD_SLOT_ID,
+                "query_start_loc": q_cpu,
+                "positions": p_cpu,
+                "block_table": bt_cpu,
+                "slot_mapping_before": sm_cpu,
+            },
+            path,
+        )
+
+        print(f"dump saved to: {path}", flush=True)
+        print("========== dump slot_mapping inputs end ==========", flush=True)
 
     def compute_slot_mapping_draft(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]

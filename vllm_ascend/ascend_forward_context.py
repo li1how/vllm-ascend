@@ -311,7 +311,8 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         if num_tokens <= mc2_tokens_capacity and world_size > 1:
             moe_comm_type = MoECommType.MC2
         elif world_size <= num_experts_per_tok:
-            moe_comm_type = MoECommType.ALLGATHER
+            # moe_comm_type = MoECommType.ALLGATHER
+            moe_comm_type = MoECommType.ALLTOALL
         else:
             moe_comm_type = MoECommType.ALLTOALL
     else:
