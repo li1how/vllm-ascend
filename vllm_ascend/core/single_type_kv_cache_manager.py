@@ -206,6 +206,9 @@ class CompressAttentionManager(FullAttentionManager):
         pcp_world_size: int = 1,
         drop_eagle_block: bool = False,
     ) -> tuple[list[KVCacheBlock], ...]:
+        # Keep pcp_world_size in this override's signature for compatibility
+        # with the upstream manager interface. PCP is rejected by the platform.
+        del pcp_world_size
         eagle_drop = drop_eagle_block
         # assert isinstance(
         #     kv_cache_spec, Compress4AttentionSpec | Compress128AttentionSpec | C4IndexerSpec
@@ -214,8 +217,8 @@ class CompressAttentionManager(FullAttentionManager):
         # )
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple([] for _ in range(len(kv_cache_group_ids)))
         block_size = kv_cache_spec.block_size
-        if dcp_world_size * pcp_world_size > 1:
-            block_size *= dcp_world_size * pcp_world_size
+        if dcp_world_size > 1:
+            block_size *= dcp_world_size
         logical_block_size = block_size * kv_cache_spec.compress_ratio
         logical_block_hashes = BlockHashListWithBlockSize(block_hashes, block_size, logical_block_size)
         max_num_blocks = max_length // logical_block_size

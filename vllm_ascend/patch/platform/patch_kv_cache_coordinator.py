@@ -92,8 +92,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         max_num_batched_tokens: int | None = None,
         scheduler_block_size: int | None = None,
     ):
+        # Keep pcp_world_size in this patched constructor for compatibility
+        # with the upstream coordinator interface. PCP is rejected by the platform.
+        del pcp_world_size
         self.dcp_world_size = dcp_world_size
-        self.pcp_world_size = pcp_world_size
         self.scheduler_block_size = scheduler_block_size
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -140,7 +142,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
-                pcp_world_size=pcp_world_size,
+                pcp_world_size=1,
                 max_in_flight_tokens=token_budget,
                 max_num_batched_tokens=token_budget,
                 max_model_len=max_model_len,
@@ -176,8 +178,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         block_size = kv_cache_spec.block_size
         if isinstance(kv_cache_spec, MambaSpec) and self.enable_caching:
             return block_size
-        if self.dcp_world_size * self.pcp_world_size > 1:
-            block_size *= self.dcp_world_size * self.pcp_world_size
+        if self.dcp_world_size > 1:
+            block_size *= self.dcp_world_size
         if hasattr(kv_cache_spec, "compress_ratio"):
             compress_ratio = kv_cache_spec.compress_ratio or 1
             compress_ratio = compress_ratio if compress_ratio >= 1 else 1
@@ -277,8 +279,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             target_block_size = kv_cache_spec.block_size
-            if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size * self.pcp_world_size > 1:
-                target_block_size *= self.dcp_world_size * self.pcp_world_size
+            if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size > 1:
+                target_block_size *= self.dcp_world_size
             if target_block_size == self.hash_block_size:
                 return block_hashes
             return BlockHashListWithBlockSize(block_hashes, self.hash_block_size, target_block_size)
@@ -327,7 +329,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     **eagle_kwarg,
                     alignment_tokens=self.lcm_block_size,
                     dcp_world_size=self.dcp_world_size,
-                    pcp_world_size=self.pcp_world_size,
+                    pcp_world_size=1,
                 )
                 _new_hit_length = len(hit_blocks[0]) * effective_block_size
                 if use_eagle:
@@ -369,8 +371,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             target_block_size = kv_cache_spec.block_size
-            if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size * self.pcp_world_size > 1:
-                target_block_size *= self.dcp_world_size * self.pcp_world_size
+            if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size > 1:
+                target_block_size *= self.dcp_world_size
             if target_block_size == self.hash_block_size:
                 return block_hashes
             return BlockHashListWithBlockSize(block_hashes, self.hash_block_size, target_block_size)
@@ -429,7 +431,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     **eagle_kwarg,
                     alignment_tokens=self.lcm_block_size,
                     dcp_world_size=self.dcp_world_size,
-                    pcp_world_size=self.pcp_world_size,
+                    pcp_world_size=1,
                 )
                 _new_hit_length = len(hit_blocks[0]) * effective_block_size
                 if use_eagle:
@@ -480,6 +482,9 @@ def get_kv_cache_coordinator(
     metrics_collector: KVCacheMetricsCollector | None = None,
     max_num_batched_tokens: int | None = None,
 ) -> KVCacheCoordinator:
+    # Keep pcp_world_size in this patched function for upstream call
+    # compatibility; platform validation guarantees that it is one.
+    del pcp_world_size
     token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens, max_num_batched_tokens)
     if _is_deepseek_v4_kv_cache_config(kv_cache_config):
         return AscendHybridKVCacheCoordinator(
@@ -489,7 +494,7 @@ def get_kv_cache_coordinator(
             enable_caching,
             enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
-            pcp_world_size=pcp_world_size,
+            pcp_world_size=1,
             hash_block_size=hash_block_size,
             eagle_attn_layer_names=eagle_attn_layer_names,
             metrics_collector=metrics_collector,
@@ -506,7 +511,7 @@ def get_kv_cache_coordinator(
             enable_caching=enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
-            pcp_world_size=pcp_world_size,
+            pcp_world_size=1,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
         )
@@ -524,7 +529,7 @@ def get_kv_cache_coordinator(
         enable_caching,
         enable_kv_cache_events,
         dcp_world_size=dcp_world_size,
-        pcp_world_size=pcp_world_size,
+        pcp_world_size=1,
         hash_block_size=hash_block_size,
         eagle_attn_layer_names=eagle_attn_layer_names,
         metrics_collector=metrics_collector,
