@@ -1,6 +1,6 @@
-
 from collections.abc import Callable
-from typing import TypeVar
+from dataclasses import dataclass
+from typing import NamedTuple, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -18,13 +18,36 @@ from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     AscendSFAMetadata,
     AscendSFAMetadataBuilder,
-    DCPContext,
-    DCPQueryGatherContext,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.distributed.utils import all_gather_async
 
 M = TypeVar("M", bound=AscendSFAMetadata)
+
+
+class DCPQueryGatherContext(NamedTuple):
+    """State needed to finish the async fused DCP query all-gather."""
+
+    gathered: torch.Tensor
+    handle: torch.distributed.Work | None
+    restore_perm: tuple[int, ...] | None
+    ql_nope_dim: int
+    q_pe_dim: int
+
+
+@dataclass
+class DCPContext:
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    seq_lens: torch.Tensor
+    query_gather_context: DCPQueryGatherContext | None = None
+
+
+@dataclass
+class AscendSFADCPMetadata(AscendSFAMetadata):
+    """SFA metadata fields used only by the DCP execution path."""
+
+    dcp_context: DCPContext | None = None
 
 
 # SFA DCP replicated-indexer layout:
@@ -54,7 +77,15 @@ class AscendSFADCPMetadataBuilder(
         metadata_cls: type[AscendSFAMetadata] | None = None,
         supports_dcp_with_varlen: bool = False,
     ):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device, metadata_cls, supports_dcp_with_varlen)
+        metadata_cls = metadata_cls or AscendSFADCPMetadata
+        super().__init__(
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            metadata_cls,
+            supports_dcp_with_varlen,
+        )
         self.cp_kv_cache_interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
         assert self.dcp_size > 1, "AscendSFADCPMetadataBuilder requires DCP world size > 1."
         if self.cp_kv_cache_interleave_size <= 0:
@@ -261,6 +292,7 @@ class AscendSFADCPMetadataBuilder(
             common_attn_metadata.slot_mapping = dcp_slot_mapping
             common_attn_metadata.block_table_tensor = dcp_block_table
 
+        assert isinstance(metadata, AscendSFADCPMetadata)
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
         if dcp_local_seq_lens is None:
             dcp_local_seq_lens = self._get_dcp_local_seq_lens(metadata.seq_lens)
@@ -480,7 +512,7 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
         gathered, handle, restore_perm = self._all_gather_dim_async(fused_q, query_gather_dim)
         return DCPQueryGatherContext(gathered, handle, restore_perm, ql_nope_dim, q_pe_dim)
 
-    def _record_dcp_query_gather_context(
+    def _record_query_gather_context(
         self,
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
@@ -488,6 +520,13 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
     ) -> None:
         assert attn_metadata.dcp_context is not None, "DCP SFA requires attn_metadata.dcp_context."
         attn_metadata.dcp_context.query_gather_context = self._start_dcp_query_gather(ql_nope, q_pe)
+
+    def _get_sfa_kv_slot_mapping(
+        self,
+        attn_metadata: M,
+    ) -> torch.Tensor:
+        assert attn_metadata.dcp_context is not None
+        return attn_metadata.dcp_context.slot_mapping
 
     def _finish_all_gather_query_for_dcp(
         self,

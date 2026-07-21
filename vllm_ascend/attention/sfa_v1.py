@@ -1,7 +1,7 @@
 import enum
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import scipy  # type: ignore
 import torch
@@ -85,20 +85,6 @@ O_PROJ_ACLNN_INPUT_PARAMS = (
 )
 
 
-class DCPQueryGatherContext(NamedTuple):
-    """State needed to finish the async fused DCP query all-gather."""
-
-    # The gathered fused query tensor: cat([ql_nope, q_pe], dim=-1).
-    gathered: torch.Tensor
-    # Async all-gather work handle. None means the gather completed synchronously.
-    handle: torch.distributed.Work | None
-    # Permutation that restores the original dimension order after dim>0 gather.
-    restore_perm: tuple[int, ...] | None
-    # Last-dimension sizes used to split the fused query back into ql_nope/q_pe.
-    ql_nope_dim: int
-    q_pe_dim: int
-
-
 def _get_indexer_types(configs: tuple[Any, ...]) -> Any | None:
     for config in configs:
         if config is None:
@@ -165,14 +151,6 @@ class AscendSFABackend(AttentionBackend):
 
 
 @dataclass
-class DCPContext:
-    slot_mapping: torch.Tensor
-    block_table: torch.Tensor
-    seq_lens: torch.Tensor
-    query_gather_context: DCPQueryGatherContext | None = None
-
-
-@dataclass
 class DSACPContext:
     num_tokens: int
     num_tokens_pad: int
@@ -215,7 +193,6 @@ class AscendSFAMetadata:
     attn_mask: torch.Tensor = None
     # chunked prefill by default if no attn_states passed
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
-    dcp_context: DCPContext | None = None
     dsa_cp_context: DSACPContext | None = None
     reshape_cache_event: torch.npu.Event = None
     num_decodes: int = 0
@@ -688,7 +665,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         num_tokens,
         vllm_config=None,
         speculative_config=None,
-        num_dcp_tokens=None,
         draft_attn_metadatas=None,
     ):
         # sfa does not need to update graph params
@@ -1568,13 +1544,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key,
         )
 
-    def _record_dcp_query_gather_context(
+    def _record_query_gather_context(
         self,
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
         attn_metadata: M,
     ) -> None:
         return
+
+    def _get_sfa_kv_slot_mapping(
+        self,
+        attn_metadata: M,
+    ) -> torch.Tensor:
+        return attn_metadata.slot_mapping
 
     def _compose_sfa_kv_cache(self, kv_cache) -> tuple[torch.Tensor, ...] | None:
         """Compose split cache handles into the tuple expected by SFA kernels.
@@ -1661,13 +1643,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             actual_seq_lengths_query = attn_metadata.cum_query_lens
             actual_seq_lengths_key = attn_metadata.seq_lens
-        # DCP replicated indexer stores LI cache with the full/no-CP metadata, while
-        # SFA KV remains stored with the DCP-sharded slot mapping.
-        slot_mapping_sfa = (
-            attn_metadata.dcp_context.slot_mapping
-            if attn_metadata.dcp_context is not None
-            else attn_metadata.slot_mapping
-        )
+        slot_mapping_sfa = self._get_sfa_kv_slot_mapping(attn_metadata)
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
@@ -1823,7 +1799,11 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
-            self._record_dcp_query_gather_context(ql_nope, q_pe, attn_metadata)
+            self._record_query_gather_context(
+                ql_nope,
+                q_pe,
+                attn_metadata,
+            )
 
             if self.enable_dsa_cp:
                 if kv_ag_handle is not None:
