@@ -518,6 +518,7 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
         q_pe: torch.Tensor,
         attn_metadata: M,
     ) -> None:
+        assert isinstance(attn_metadata, AscendSFADCPMetadata)
         assert attn_metadata.dcp_context is not None, "DCP SFA requires attn_metadata.dcp_context."
         attn_metadata.dcp_context.query_gather_context = self._start_dcp_query_gather(ql_nope, q_pe)
 
@@ -525,6 +526,7 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
         self,
         attn_metadata: M,
     ) -> torch.Tensor:
+        assert isinstance(attn_metadata, AscendSFADCPMetadata)
         assert attn_metadata.dcp_context is not None
         return attn_metadata.dcp_context.slot_mapping
 

@@ -40,9 +40,7 @@ class AscendPCPManager(PCPManager):
         local_batch = super().partition_batch(input_batch)
         assert isinstance(local_batch, AscendInputBatch)
 
-        local_seq_lens_np = (
-            local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
-        )
+        local_seq_lens_np = local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
         local_batch.seq_lens_np = local_seq_lens_np
         local_batch.attn_state = build_attn_state(
             self.vllm_config,
@@ -52,7 +50,6 @@ class AscendPCPManager(PCPManager):
             local_batch.num_scheduled_tokens,
         )
         return local_batch
-
 
 
 def maybe_build_ascend_pcp_manager(

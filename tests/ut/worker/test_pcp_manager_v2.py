@@ -22,10 +22,10 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
-
-import vllm_ascend.worker.v2.pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
+
+import vllm_ascend.worker.v2.pcp_manager as pcp_manager_module
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import (
     AscendPCPManager,
@@ -179,13 +179,16 @@ def test_maybe_build_ascend_pcp_manager_returns_none_when_pcp_is_disabled():
         parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
     )
 
-    assert maybe_build_ascend_pcp_manager(
-        vllm_config,
-        torch.device("cpu"),
-        supports_mm_inputs=False,
-        req_states=MagicMock(),
-        block_tables=MagicMock(),
-    ) is None
+    assert (
+        maybe_build_ascend_pcp_manager(
+            vllm_config,
+            torch.device("cpu"),
+            supports_mm_inputs=False,
+            req_states=MagicMock(),
+            block_tables=MagicMock(),
+        )
+        is None
+    )
 
 
 def test_maybe_build_ascend_pcp_manager_uses_ascend_subclass():
