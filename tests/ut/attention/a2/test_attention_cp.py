@@ -160,6 +160,7 @@ def test_pcp_cache_gather_keeps_one_decode_and_all_padded_prefills() -> None:
         patch(
             "vllm_ascend.attention.context_parallel.attention_cp.DeviceOperator.reshape_and_cache"
         ) as reshape_and_cache,
+        patch("vllm_ascend.attention.context_parallel.attention_cp.logger.info_once") as info_once,
         patch("vllm_ascend.attention.context_parallel.attention_cp.notify_kv_cache_written") as notify_cache_written,
     ):
         result = impl.reshape_and_cache(
@@ -186,6 +187,12 @@ def test_pcp_cache_gather_keeps_one_decode_and_all_padded_prefills() -> None:
     )
     assert kwargs["key_cache"] is key_cache
     assert kwargs["value_cache"] is value_cache
+    info_once.assert_called_once_with(
+        "[GQA-PCP] Entered KV gather path: local_kv=%s, gathered_kv=%s, slots=%s",
+        (4, 1, 1),
+        (7, 1, 1),
+        (7,),
+    )
     notify_cache_written.assert_called_once_with()
     assert result[0] is query
     assert result[1] is key

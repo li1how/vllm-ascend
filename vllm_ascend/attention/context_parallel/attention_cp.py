@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from vllm.distributed.parallel_state import get_pcp_group
+from vllm.logger import logger
 from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -159,6 +160,12 @@ class AscendAttentionPCPImpl(AscendAttentionBackendImpl):
             ),
             expanded_slot_mapping,
             attn_metadata.num_decode_tokens,
+        )
+        logger.info_once(
+            "[GQA-PCP] Entered KV gather path: local_kv=%s, gathered_kv=%s, slots=%s",
+            tuple(key[:local_num_input_tokens].shape),
+            tuple(cache_key.shape),
+            tuple(cache_slot_mapping.shape),
         )
         DeviceOperator.reshape_and_cache(
             key=cache_key,
