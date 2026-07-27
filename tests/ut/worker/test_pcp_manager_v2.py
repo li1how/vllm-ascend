@@ -72,7 +72,9 @@ def _make_gqa_pcp_config():
         scheduler_config=SimpleNamespace(
             max_num_seqs=8,
             max_num_batched_tokens=32,
+            enable_chunked_prefill=False,
         ),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
         lora_config=None,
         speculative_config=None,
@@ -279,11 +281,12 @@ def test_maybe_build_ascend_pcp_manager_uses_ascend_subclass():
         ("encoder_decoder", "encoder-decoder"),
         ("mm", "MM inputs"),
         ("lora", "LoRA"),
-        ("spec_decode", "speculative decoding"),
-        ("quantization", "quantized models"),
-        ("graph", "eager mode only"),
-        ("dtype", "BF16 models only"),
+        ("mtp", "speculative decoding"),
+        ("eagle3", "speculative decoding"),
+        ("prefix_caching", "prefix caching"),
+        ("chunked_prefill", "scheduler chunked prefill"),
         ("mha", "num_attention_heads"),
+        ("invalid_gqa_heads", "num_attention_heads"),
     ],
 )
 @pytest.mark.skipif(vllm_version_is("0.25.1"), reason="requires vllm main branch")
@@ -298,25 +301,42 @@ def test_validate_ascend_gqa_pcp_rejects_unsupported_modes(case, match):
         vllm_config.model_config.is_encoder_decoder = True
     elif case == "lora":
         vllm_config.lora_config = object()
-    elif case == "spec_decode":
-        vllm_config.speculative_config = object()
-    elif case == "quantization":
-        vllm_config.model_config.quantization = "ascend"
-    elif case == "graph":
-        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-    elif case == "dtype":
-        vllm_config.model_config.dtype = torch.float16
+    elif case in ("mtp", "eagle3"):
+        vllm_config.speculative_config = SimpleNamespace(method=case)
+    elif case == "prefix_caching":
+        vllm_config.cache_config.enable_prefix_caching = True
+    elif case == "chunked_prefill":
+        vllm_config.scheduler_config.enable_chunked_prefill = True
     elif case == "mha":
         vllm_config.model_config.hf_text_config.num_key_value_heads = 32
+    elif case == "invalid_gqa_heads":
+        vllm_config.model_config.hf_text_config.num_attention_heads = 30
 
     with pytest.raises(NotImplementedError, match=match):
         validate_ascend_pcp_config(vllm_config, supports_mm_inputs=supports_mm_inputs)
+
+
+@pytest.mark.parametrize("case", ["dtype", "quantization", "piecewise_graph"])
+@pytest.mark.skipif(vllm_version_is("0.25.1"), reason="requires vllm main branch")
+def test_validate_ascend_gqa_pcp_uses_mla_baseline_validation(case):
+    vllm_config = _make_gqa_pcp_config()
+    if case == "dtype":
+        vllm_config.model_config.dtype = torch.float16
+    elif case == "quantization":
+        vllm_config.model_config.quantization = "ascend"
+    elif case == "piecewise_graph":
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+    validate_ascend_pcp_config(vllm_config, supports_mm_inputs=False)
 
 
 @pytest.mark.skipif(vllm_version_is("0.25.1"), reason="requires vllm main branch")
 def test_validate_ascend_pcp_calls_upstream_validation_before_mla_return():
     vllm_config = _make_gqa_pcp_config()
     vllm_config.model_config.use_mla = True
+    vllm_config.parallel_config.decode_context_parallel_size = 2
+    vllm_config.cache_config.enable_prefix_caching = True
+    vllm_config.scheduler_config.enable_chunked_prefill = True
 
     with patch.object(pcp_manager_module.PCPManager, "validate_config") as validate_upstream:
         validate_ascend_pcp_config(vllm_config, supports_mm_inputs=False)
