@@ -1180,7 +1180,21 @@
 #    Future Plan:
 #       remove this when vllm-ascend's attention metadata is align with vllm.
 #
-# ** 31. File: worker/patch_v2/patch_triton.py**
+# ** 31. File: worker/patch_v2/patch_pcp_manager.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.worker.gpu.pcp_manager.PCPManager.validate_config`
+#    Why:
+#       Upstream MRV2 PCP validation accepts only MLA, and the GPU runner invokes
+#       it before the NPU runner can replace the generic PCP manager.
+#    How:
+#       Delegate MLA validation upstream and allow only the Ascend BF16 eager GQA
+#       subset while preserving the existing unsupported-feature restrictions.
+#    Related PR (if no, explain why):
+#       No. This is a temporary backend capability override.
+#    Future Plan:
+#       Remove this patch when upstream exposes a backend hook or supports GQA PCP.
+#
+# ** 32. File: worker/patch_v2/patch_triton.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.gpu.sample.logprob`, `vllm.v1.worker.gpu.sample.penalties.apply_penalties`,
 #      `vllm.v1.worker.gpu.sample.gumbel.gumbel_sample`
@@ -1193,7 +1207,7 @@
 #    Future Plan:
 #       Remove this patch when vLLM support the dispatch function.
 #
-# ** 32. File: worker/patch_v2/patch_use_v2_model_runner.py**
+# ** 33. File: worker/patch_v2/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.vllm.VllmConfig.use_v2_model_runner`
 #    Why:
@@ -1209,7 +1223,7 @@
 #       Remove this module together with the platform patch once vllm-ascend
 #       fully supports the v2 model runner.
 #
-# ** 33. File: worker/patch_v2/patch_uva.py**
+# ** 34. File: worker/patch_v2/patch_uva.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.gpu.states.UvaBuffer`
 #    Why:
