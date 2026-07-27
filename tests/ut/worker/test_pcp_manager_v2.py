@@ -314,14 +314,11 @@ def test_validate_ascend_gqa_pcp_rejects_unsupported_modes(case, match):
 
 
 @pytest.mark.skipif(vllm_version_is("0.25.1"), reason="requires vllm main branch")
-def test_validate_ascend_pcp_preserves_upstream_mla_validation():
+def test_validate_ascend_pcp_calls_upstream_validation_before_mla_return():
     vllm_config = _make_gqa_pcp_config()
     vllm_config.model_config.use_mla = True
 
-    with patch.object(
-        pcp_manager_module,
-        "_UPSTREAM_PCP_VALIDATE_CONFIG",
-    ) as validate_upstream:
+    with patch.object(pcp_manager_module.PCPManager, "validate_config") as validate_upstream:
         validate_ascend_pcp_config(vllm_config, supports_mm_inputs=False)
 
     validate_upstream.assert_called_once_with(vllm_config, False)
