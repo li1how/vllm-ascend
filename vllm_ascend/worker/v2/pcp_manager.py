@@ -27,8 +27,6 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
-_UPSTREAM_PCP_VALIDATE_CONFIG = PCPManager.validate_config
-
 
 def validate_ascend_pcp_config(
     vllm_config: VllmConfig,
@@ -40,24 +38,12 @@ def validate_ascend_pcp_config(
     if parallel_config.prefill_context_parallel_size <= 1:
         return
 
-    # Preserve the upstream MLA validation semantics. The additional path
-    # below is intentionally limited to unquantized BF16 GQA in eager mode.
+    PCPManager.validate_config(vllm_config, supports_mm_inputs)
     if model_config.use_mla:
-        _UPSTREAM_PCP_VALIDATE_CONFIG(vllm_config, supports_mm_inputs)
         return
 
     if parallel_config.decode_context_parallel_size > 1:
         raise NotImplementedError("Ascend MRV2 GQA PCP does not support PCP and DCP simultaneously yet.")
-    if parallel_config.pipeline_parallel_size > 1:
-        raise NotImplementedError("Ascend MRV2 GQA PCP does not support PP yet.")
-    if model_config.is_encoder_decoder:
-        raise NotImplementedError("Ascend MRV2 GQA PCP does not support encoder-decoder models yet.")
-    if supports_mm_inputs:
-        raise NotImplementedError("Ascend MRV2 GQA PCP does not support MM inputs yet.")
-    if vllm_config.lora_config is not None:
-        raise NotImplementedError("Ascend MRV2 GQA PCP does not support LoRA yet.")
-    if vllm_config.speculative_config is not None:
-        raise NotImplementedError("Ascend MRV2 GQA PCP does not support speculative decoding yet.")
     if model_config.quantization is not None:
         raise NotImplementedError("Ascend MRV2 GQA PCP does not support quantized models yet.")
     if model_config.dtype != torch.bfloat16:

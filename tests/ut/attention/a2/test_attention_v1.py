@@ -96,6 +96,7 @@ class TestAscendAttentionBackend(TestBase):
             AscendAttentionBackend.get_impl_cls(),
             AscendAttentionPCPImpl,
         )
+        self.assertTrue(AscendAttentionBackend.supports_pcp())
 
     def test_get_builder_cls_with_pcp(self):
         self.mock_config.parallel_config.prefill_context_parallel_size = 2

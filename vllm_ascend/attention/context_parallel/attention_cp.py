@@ -122,6 +122,8 @@ class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
 class AscendAttentionPCPImpl(AscendAttentionBackendImpl):
     """MRV2 GQA implementation for prefill context parallelism."""
 
+    supports_pcp = True
+
     def reshape_and_cache(
         self,
         query: torch.Tensor,
