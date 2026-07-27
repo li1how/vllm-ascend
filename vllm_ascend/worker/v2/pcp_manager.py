@@ -18,7 +18,7 @@
 #
 
 import torch
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -44,13 +44,11 @@ def validate_ascend_pcp_config(
 
     if parallel_config.decode_context_parallel_size > 1:
         raise NotImplementedError("Ascend MRV2 GQA PCP does not support PCP and DCP simultaneously yet.")
-    if model_config.quantization is not None:
-        raise NotImplementedError("Ascend MRV2 GQA PCP does not support quantized models yet.")
-    if model_config.dtype != torch.bfloat16:
-        raise NotImplementedError("Ascend MRV2 GQA PCP currently supports BF16 models only.")
-    if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise NotImplementedError("Ascend MRV2 GQA PCP does not support prefix caching yet. Disable prefix caching.")
+    if vllm_config.scheduler_config.enable_chunked_prefill:
         raise NotImplementedError(
-            "Ascend MRV2 GQA PCP currently supports eager mode only. Set -cc.cudagraph_mode=NONE."
+            "Ascend MRV2 GQA PCP does not support scheduler chunked prefill yet. Disable chunked prefill."
         )
 
     text_config = model_config.hf_text_config
