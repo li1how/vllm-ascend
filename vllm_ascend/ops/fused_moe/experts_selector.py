@@ -245,7 +245,9 @@ def _select_experts_with_fusion_ops(
     renorm = int(renormalize)
     if scoring_func == "sqrtsoftplus":
         if tid2eid is not None:
-            input_ids = _EXTRA_CTX.input_ids.to(torch.int64)
+            if input_ids is None:
+                raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+            input_ids = input_ids.to(torch.int64)
             # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
             tid2eid_ones = tid2eid.to(torch.int32)
             if _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER:
