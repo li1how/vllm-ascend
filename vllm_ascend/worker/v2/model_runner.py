@@ -294,7 +294,9 @@ class NPUModelRunner(GPUModelRunner):
             so we need to prepare seq_lens_cpu here.
             """
             num_tokens = scheduler_output.total_num_scheduled_tokens
-            num_tokens_after_padding = batch_desc.num_tokens
+            # PCP dispatches only the largest rank-local token count, but the
+            # global batch must stay intact until PCPManager partitions it.
+            num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
             assert num_tokens > 0
             num_tokens_per_req = scheduler_output.num_scheduled_tokens
             num_reqs = len(num_tokens_per_req)
@@ -507,7 +509,9 @@ class NPUModelRunner(GPUModelRunner):
             so we need to prepare seq_lens_cpu here.
             """
             num_tokens = scheduler_output.total_num_scheduled_tokens
-            num_tokens_after_padding = batch_desc.num_tokens
+            # PCP dispatches only the largest rank-local token count, but the
+            # global batch must stay intact until PCPManager partitions it.
+            num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
             assert num_tokens > 0
             num_tokens_per_req = scheduler_output.num_scheduled_tokens
             num_reqs = len(num_tokens_per_req)
