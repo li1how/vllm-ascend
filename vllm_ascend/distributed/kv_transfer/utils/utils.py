@@ -64,14 +64,13 @@ def get_transfer_timeout_value():
 @dataclass
 class parallel_info:
     tp_size: int
-    pcp_size: int
     dcp_size: int
     use_mla: bool
     pd_head_ratio: int
 
 
 def get_cp_group(tp: int, heads: int, dcp: int):
-    # Partition the second dimension of [pcp][head_group][dcp] to obtain a complete head group
+    # Partition [head_group][dcp] to obtain a complete head group.
     # head_group is all blocks for request in the same head
     # tp8 dcp2 heads4 return[[0,1,2,3]]
     # tp8 dcp1 heads4 return[[0,2,4,6],[1,3,5,7]]
@@ -86,14 +85,13 @@ def get_cp_group(tp: int, heads: int, dcp: int):
 
 
 def context_parallel_parameters_check(
-    remote_pcp_size: int,
-    remote_dcp_size: int,
     p_parallel_info: parallel_info,
     d_parallel_info: parallel_info,
     total_num_kv_heads: int,
 ):
-    # Check whether the pcp–dcp ratio is supported
-    assert (p_parallel_info.pcp_size * p_parallel_info.dcp_size) % (remote_pcp_size * remote_dcp_size) == 0
+    # MRV2 PCP ranks replicate prompt KV. Layerwise transfer only maps DCP
+    # shards, so the P-side DCP degree must cover the D-side degree.
+    assert p_parallel_info.dcp_size % d_parallel_info.dcp_size == 0
     if not p_parallel_info.use_mla:
         p_node_heads_per_rank = math.ceil(total_num_kv_heads / p_parallel_info.tp_size)
         d_node_heads_per_rank = math.ceil(total_num_kv_heads / d_parallel_info.dcp_size)
@@ -160,39 +158,28 @@ def get_local_remote_block_port_mappings(
 ):
     p_head_group_size = p_parallel_info.tp_size // p_parallel_info.dcp_size
     d_head_group_size = d_parallel_info.tp_size // d_parallel_info.dcp_size
-    world_size = d_parallel_info.pcp_size * d_head_group_size * d_parallel_info.dcp_size
+    world_size = d_head_group_size * d_parallel_info.dcp_size
     # Compute which logic_block_idx corresponds to each tp_rank
-    p_rank_block_mapping: list[list[list[list[int]]]] = [
-        [[[] for _ in range(p_parallel_info.dcp_size)] for _ in range(p_head_group_size)]
-        for _ in range(p_parallel_info.pcp_size)
+    p_rank_block_mapping: list[list[list[int]]] = [
+        [[] for _ in range(p_parallel_info.dcp_size)] for _ in range(p_head_group_size)
     ]
     for logic_block_idx in range(to_trans_idx):
-        pcp_rank = (logic_block_idx // p_parallel_info.dcp_size) % p_parallel_info.pcp_size
         dcp_rank = logic_block_idx % p_parallel_info.dcp_size
         for p_head_group_rank in range(p_head_group_size):
             if p_head_group_rank in selected_p_cp_group:
-                p_rank_block_mapping[pcp_rank][p_head_group_rank][dcp_rank].append(logic_block_idx)
+                p_rank_block_mapping[p_head_group_rank][dcp_rank].append(logic_block_idx)
 
     # Find the remote device that holds the logic_block_idx
     d_block_rank_mapping: dict[int, dict[int, dict[str, Any]]] = defaultdict(lambda: defaultdict(dict))
     for logic_block_idx in range(to_trans_idx):
-        pcp_rank = (logic_block_idx // d_parallel_info.dcp_size) % d_parallel_info.pcp_size
         for d_head_group_rank in range(d_head_group_size):
             if d_head_group_rank in selected_d_cp_group:
                 dcp_rank = logic_block_idx % d_parallel_info.dcp_size
-                world_rank = (
-                    pcp_rank * d_head_group_size * d_parallel_info.dcp_size
-                    + d_head_group_rank * d_parallel_info.dcp_size
-                    + dcp_rank
-                )
-                world_size = d_parallel_info.pcp_size * d_head_group_size * d_parallel_info.dcp_size
+                world_rank = d_head_group_rank * d_parallel_info.dcp_size + dcp_rank
                 host = d_hosts[(len(d_hosts) * world_rank) // world_size]
                 port = d_port + world_rank
-                block_idx = (logic_block_idx - (pcp_rank * d_parallel_info.pcp_size + dcp_rank)) // (
-                    d_parallel_info.pcp_size * d_parallel_info.dcp_size
-                )
+                block_idx = (logic_block_idx - dcp_rank) // d_parallel_info.dcp_size
                 d_block_rank_mapping[logic_block_idx][d_head_group_rank] = {
-                    "pcp_rank": pcp_rank,
                     "dcp_rank": dcp_rank,
                     "host": host,
                     "port": port,
@@ -202,33 +189,27 @@ def get_local_remote_block_port_mappings(
     d_trans_count_mapping = {}
     trans_block_size = math.ceil(prompt_len / block_size)  # Total number of blocks
     transed_block_size = math.ceil(req_meta.remote_cache_tokens / block_size)  # Number of prefix cache hit blocks
-    d_cp_size = d_parallel_info.pcp_size * d_parallel_info.dcp_size
-    for d_pcp_rank in range(d_parallel_info.pcp_size):
-        for d_head_group_rank in range(d_head_group_size):
-            for d_dcp_rank in range(d_parallel_info.dcp_size):
-                if trans_block_size >= (p_parallel_info.pcp_size * p_parallel_info.dcp_size):
-                    trans_count = (p_parallel_info.pcp_size * p_parallel_info.dcp_size) // d_cp_size
-                else:
-                    current_rank_idx = d_pcp_rank * d_parallel_info.dcp_size + d_dcp_rank
-                    total_global_blocks = transed_block_size + trans_block_size
+    d_cp_size = d_parallel_info.dcp_size
+    for d_head_group_rank in range(d_head_group_size):
+        for d_dcp_rank in range(d_parallel_info.dcp_size):
+            if trans_block_size >= p_parallel_info.dcp_size:
+                trans_count = p_parallel_info.dcp_size // d_cp_size
+            else:
+                total_global_blocks = transed_block_size + trans_block_size
 
-                    target_total_count = total_global_blocks // d_cp_size
-                    if current_rank_idx < (total_global_blocks % d_cp_size):
-                        target_total_count += 1
+                target_total_count = total_global_blocks // d_cp_size
+                if d_dcp_rank < (total_global_blocks % d_cp_size):
+                    target_total_count += 1
 
-                    prev_processed_count = transed_block_size // d_cp_size
-                    if current_rank_idx < (transed_block_size % d_cp_size):
-                        prev_processed_count += 1
+                prev_processed_count = transed_block_size // d_cp_size
+                if d_dcp_rank < (transed_block_size % d_cp_size):
+                    prev_processed_count += 1
 
-                    trans_count = target_total_count - prev_processed_count
-                world_rank = (
-                    d_pcp_rank * d_head_group_size * d_parallel_info.dcp_size
-                    + d_head_group_rank * d_parallel_info.dcp_size
-                    + d_dcp_rank
-                )
-                host = d_hosts[(len(d_hosts) * world_rank) // world_size]
-                port = d_port + world_rank
-                d_trans_count_mapping[(host, port)] = trans_count * p_parallel_info.pd_head_ratio
+                trans_count = target_total_count - prev_processed_count
+            world_rank = d_head_group_rank * d_parallel_info.dcp_size + d_dcp_rank
+            host = d_hosts[(len(d_hosts) * world_rank) // world_size]
+            port = d_port + world_rank
+            d_trans_count_mapping[(host, port)] = trans_count * p_parallel_info.pd_head_ratio
 
     # Compute the mapping between local and remote head_group_rank
     p_tp_rank_head_mapping = get_head_group_mapping(
@@ -264,7 +245,7 @@ def get_local_remote_block_port_mappings(
 
 
 def get_transfer_mappings(
-    p_rank_block_mapping: list[list[list[list[int]]]],
+    p_rank_block_mapping: list[list[list[int]]],
     d_block_rank_mapping: dict[int, dict[int, dict[str, Any]]],
     pd_head_mapping: dict[int, set],
     d_trans_count_mapping: dict[tuple[str, int], int],
@@ -275,12 +256,11 @@ def get_transfer_mappings(
     transed_idx: int,
     to_trans_idx: int,
     tp_rank: int,
-    pcp_rank: int,
     dcp_rank: int,
 ):
     transfer_mappings: dict[tuple[str, int], dict[str, Any]] = {}
     p_head_group_rank = (tp_rank - dcp_rank) // p_parallel_info.dcp_size
-    p_block_idxs: list[int] = p_rank_block_mapping[pcp_rank][p_head_group_rank][dcp_rank]
+    p_block_idxs: list[int] = p_rank_block_mapping[p_head_group_rank][dcp_rank]
     p_block_ids = req_meta.local_block_ids[block_group_idx]
     d_block_ids = req_meta.remote_block_ids[block_group_idx]
     for p_block_idx, logic_block_idx in enumerate(p_block_idxs):

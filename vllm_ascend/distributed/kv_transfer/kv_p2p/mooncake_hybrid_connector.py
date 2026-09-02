@@ -1234,7 +1234,9 @@ class MooncakeConnectorScheduler:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
-        assert self.pcp_size * self.dcp_size == 1, "Mooncake Hybrid Connector only support cp_world_size == 1. "
+        assert self.pcp_size == 1 and self.dcp_size == 1, (
+            "Mooncake Hybrid Connector only supports PCP size 1 and DCP size 1."
+        )
         self.max_device_id = (
             vllm_config.parallel_config.tensor_parallel_size
             * vllm_config.parallel_config.data_parallel_size
@@ -1564,7 +1566,9 @@ class MooncakeConnectorWorker:
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
-        assert self.pcp_size * self.dcp_size == 1, "Mooncake Hybrid Connector only support cp_world_size == 1. "
+        assert self.pcp_size == 1 and self.dcp_size == 1, (
+            "Mooncake Hybrid Connector only supports PCP size 1 and DCP size 1."
+        )
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.side_channel_host = get_ip()
 

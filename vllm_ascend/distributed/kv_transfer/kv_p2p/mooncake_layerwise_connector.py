@@ -25,7 +25,6 @@ import torch_npu
 import zmq
 from mooncake.engine import TransferEngine  # type: ignore
 from vllm.config import VllmConfig
-from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -112,7 +111,6 @@ class ReqMeta:
     remote_layer_metadata: dict[str, LayerMetadata] | None
     metaserver: str | None
     remote_tp_size: int | None
-    remote_pcp_size: int | None
     remote_dcp_size: int | None
     chunk_finish: bool = False
     prompt_len: int = 0
@@ -725,7 +723,6 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
             remote_layer_metadata=kv_transfer_params.get("remote_layer_metadata"),
             metaserver=kv_transfer_params.get("metaserver"),
             remote_tp_size=kv_transfer_params.get("remote_tp_size"),
-            remote_pcp_size=kv_transfer_params.get("remote_pcp_size"),
             remote_dcp_size=kv_transfer_params.get("remote_dcp_size"),
             do_virtual=kv_transfer_params.get("do_virtual"),
             chunk_finish=chunk_finish,
@@ -859,11 +856,8 @@ class MooncakeLayerwiseConnectorScheduler:
 
         self.side_channel_host = get_ip()
 
-        # disable prefill context parallel on decoder nodes
-        if vllm_config.kv_transfer_config.is_kv_consumer:
-            assert vllm_config.parallel_config.prefill_context_parallel_size == 1, (
-                "Prefill context parallel is not support on decoder nodes"
-            )
+        if vllm_config.parallel_config.prefill_context_parallel_size != 1:
+            raise NotImplementedError("MooncakeLayerwiseConnector does not support MRV2 replicated PCP.")
 
         # Handshake base port
         self.side_channel_port = (
@@ -1026,7 +1020,6 @@ class MooncakeLayerwiseConnectorScheduler:
                 remote_host=self.side_channel_host,
                 remote_port=self.side_channel_port,
                 remote_tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-                remote_pcp_size=self.vllm_config.parallel_config.prefill_context_parallel_size,
                 remote_dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
                 remote_cached_tokens=remote_cached_tokens,
             )
@@ -1188,6 +1181,9 @@ class MooncakeLayerwiseConnectorWorker:
     """Implementation of Worker side methods"""
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
+        if vllm_config.parallel_config.prefill_context_parallel_size != 1:
+            raise NotImplementedError("MooncakeLayerwiseConnector does not support MRV2 replicated PCP.")
+
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
 
         if TransferEngine is None:
@@ -1204,8 +1200,6 @@ class MooncakeLayerwiseConnectorWorker:
         self.dp_rank: int = vllm_config.parallel_config.data_parallel_rank
         self.tp_rank: int = get_tensor_model_parallel_rank()
         self.tp_size: int = vllm_config.parallel_config.tensor_parallel_size
-        self.pcp_size: int = vllm_config.parallel_config.prefill_context_parallel_size
-        self.pcp_rank: int = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size: int = vllm_config.parallel_config.decode_context_parallel_size
         self.dcp_rank: int = get_decode_context_model_parallel_rank() if self.dcp_size > 1 else 0
         self.tp_group = get_tp_group()
@@ -1221,11 +1215,7 @@ class MooncakeLayerwiseConnectorWorker:
             self.total_num_kv_heads = self.vllm_config.model_config.get_total_num_kv_heads()
 
         # Handshake base port
-        self.side_channel_port = (
-            vllm_config.kv_transfer_config.kv_port
-            + self.dp_rank * self.pcp_size * self.tp_size
-            + self.pcp_rank * self.tp_size
-        )
+        self.side_channel_port = vllm_config.kv_transfer_config.kv_port + self.dp_rank * self.tp_size
         self.handshake_port = self.side_channel_port + self.tp_rank
         self.sockets: dict = {}
         logger.info("Initializing Mooncake work %s", engine_id)
@@ -1577,7 +1567,6 @@ class MooncakeLayerwiseConnectorWorker:
 
     # {(ip, port)]: {local_block_ids: [], remote_block_ids: {}}}
     def _get_kv_split_metadata(self, req_meta: ReqMeta, req_idx: int, req_id: str, group_idx: int):
-        remote_pcp_size = req_meta.remote_pcp_size
         remote_dcp_size = req_meta.remote_dcp_size
         remote_tp_size = req_meta.remote_tp_size
         remote_hosts = [req_meta.remote_host]
@@ -1588,32 +1577,25 @@ class MooncakeLayerwiseConnectorWorker:
         prompt_len = req_meta.prompt_len
         p_parallel_info = parallel_info(
             tp_size=self.tp_size,
-            pcp_size=self.pcp_size,
             dcp_size=self.dcp_size,
             pd_head_ratio=self.pd_head_ratio,
             use_mla=self.use_mla,
         )
         d_parallel_info = parallel_info(
             tp_size=remote_tp_size,
-            pcp_size=remote_pcp_size,
             dcp_size=remote_dcp_size,
             pd_head_ratio=self.pd_head_ratio,
             use_mla=self.use_mla,
         )
-        cp_size = self.pcp_size * self.dcp_size
+        cp_size = self.dcp_size
         # to_trans_idx all tokens that have been processed up to the current step
         if req_meta.chunk_finish:
             to_trans_idx = math.ceil(local_computed_tokens / self.block_size[group_idx])
         else:
             to_trans_idx = math.floor(local_computed_tokens / self.block_size[group_idx])
         prompt_block_size = math.ceil(prompt_len / self.block_size[group_idx])
-        #
-        num_local_blocks = prompt_block_size // cp_size + int(
-            (prompt_block_size % cp_size) > (self.pcp_rank * self.dcp_size + self.dcp_rank)
-        )
-        already_send_blocks = to_trans_idx // cp_size + int(
-            (to_trans_idx % cp_size) > (self.pcp_rank * self.dcp_size + self.dcp_rank)
-        )
+        num_local_blocks = prompt_block_size // cp_size + int((prompt_block_size % cp_size) > self.dcp_rank)
+        already_send_blocks = to_trans_idx // cp_size + int((to_trans_idx % cp_size) > self.dcp_rank)
         if num_local_blocks == already_send_blocks:
             req_meta.chunk_finish = True
         transed_idx = math.floor(local_transed_tokens / self.block_size[group_idx])
@@ -1651,9 +1633,7 @@ class MooncakeLayerwiseConnectorWorker:
             selected_d_cp_group,
         )
 
-        context_parallel_parameters_check(
-            remote_pcp_size, remote_dcp_size, p_parallel_info, d_parallel_info, self.total_num_kv_heads
-        )
+        context_parallel_parameters_check(p_parallel_info, d_parallel_info, self.total_num_kv_heads)
         p_rank_block_mapping, d_block_rank_mapping, pd_head_mapping, d_trans_count_mapping = (
             get_local_remote_block_port_mappings(
                 to_trans_idx,
@@ -1682,7 +1662,6 @@ class MooncakeLayerwiseConnectorWorker:
             transed_idx,
             to_trans_idx,
             self.tp_rank,
-            self.pcp_rank,
             self.dcp_rank,
         )
         return transfer_mappings
@@ -1715,7 +1694,7 @@ class MooncakeLayerwiseConnectorWorker:
                 assert remote_block_size[i] > self.block_size[i] and remote_block_size[i] % self.block_size[i] == 0, (
                     "Remote block size must be divisible by local block size."
                 )
-                assert self.pcp_size * self.dcp_size * req_meta.remote_pcp_size * req_meta.remote_dcp_size == 1, (
+                assert self.dcp_size * req_meta.remote_dcp_size == 1, (
                     "Context parallel does not support different P/D block size now."
                 )
                 pd_block_size_ratio = remote_block_size[i] // self.block_size[i]

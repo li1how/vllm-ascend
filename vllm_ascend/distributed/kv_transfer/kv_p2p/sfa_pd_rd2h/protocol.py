@@ -73,7 +73,6 @@ class SfaPDProducerReqMeta:
     remote_layer_metadata: dict[str, LayerMetadata] | None
     metaserver: str | None
     remote_tp_size: int | None
-    remote_pcp_size: int | None
     remote_dcp_size: int | None
     chunk_finish: bool = False
     prompt_len: int = 0
@@ -117,7 +116,6 @@ class SfaPDProducerMetadata(KVConnectorMetadata):
             remote_layer_metadata=kv_transfer_params.get("remote_layer_metadata"),
             metaserver=kv_transfer_params.get("metaserver"),
             remote_tp_size=kv_transfer_params.get("remote_tp_size"),
-            remote_pcp_size=kv_transfer_params.get("remote_pcp_size"),
             remote_dcp_size=kv_transfer_params.get("remote_dcp_size"),
             do_virtual=kv_transfer_params.get("do_virtual", False),
             chunk_finish=chunk_finish,

@@ -331,7 +331,6 @@ class SFAPDRD2HScheduler:
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
             remote_tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-            remote_pcp_size=self.vllm_config.parallel_config.prefill_context_parallel_size,
             remote_dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
             remote_cached_tokens=request.num_computed_tokens,
         )

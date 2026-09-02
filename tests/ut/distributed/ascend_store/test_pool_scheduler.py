@@ -86,6 +86,17 @@ class TestKVPoolScheduler(unittest.TestCase):
         return make_config(kv_role, extra_config, block_size)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_pcp_does_not_scale_pool_block_geometry(self, mock_client_cls):
+        config = self._make_config(block_size=16)
+        config.parallel_config.prefill_context_parallel_size = 2
+        config.parallel_config.decode_context_parallel_size = 2
+
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+
+        self.assertEqual(scheduler.grouped_block_size, [32])
+        self.assertEqual(scheduler.hash_block_size, 32)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_early_returns(self, mock_client_cls):
         for role, block_size, token_count in [("kv_consumer", 16, 64), ("kv_producer", 64, 32)]:
             with self.subTest(role=role, block_size=block_size):

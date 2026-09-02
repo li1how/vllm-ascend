@@ -53,13 +53,16 @@ def make_worker(
     use_mla=False,
     enable_kv_events=False,
     num_hidden_layers=None,
+    pcp_size=1,
+    dcp_size=1,
 ):
     module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
     start_patch(test, f"{module}.get_tensor_model_parallel_rank", return_value=tp_rank)
     start_patch(test, f"{module}.get_tensor_model_parallel_world_size", return_value=tp_size)
     pcp_group = start_patch(test, f"{module}.get_pcp_group")
-    pcp_group.return_value.world_size = 1
-    start_patch(test, f"{module}.get_decode_context_model_parallel_world_size", return_value=1)
+    pcp_group.return_value.world_size = pcp_size
+    pcp_group.return_value.rank_in_group = 0
+    start_patch(test, f"{module}.get_decode_context_model_parallel_world_size", return_value=dcp_size)
     start_patch(test, f"{module}.get_decode_context_model_parallel_rank", return_value=0)
     importlib = start_patch(test, f"{module}.importlib")
     importlib.import_module.return_value = MagicMock()
@@ -97,6 +100,12 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
         return KVPoolWorker
+
+    def test_pcp_does_not_scale_pool_block_geometry(self):
+        worker = make_worker(self, pcp_size=2, dcp_size=2)
+
+        self.assertEqual(worker.grouped_block_size, [32])
+        self.assertEqual(worker.hash_block_size, 32)
 
     def test_check_all_layers_exists(self):
         cls = self._make_worker_class()

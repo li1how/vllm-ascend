@@ -65,6 +65,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     string_to_int64_hash,
     zmq_ctx,
 )
+from vllm_ascend.distributed.kv_transfer.utils.utils import (  # noqa: E402
+    get_local_remote_block_port_mappings,
+    get_transfer_mappings,
+    parallel_info,
+)
 
 # Restore the mocked modules so other test files still work correctly.
 # For keys that our real import loaded, overwrite with the saved mock.
@@ -184,7 +189,6 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             },
             metaserver="http://dummy",
             remote_tp_size=8,
-            remote_pcp_size=1,
             remote_dcp_size=1,
             chunk_finish=False,
         )
@@ -829,6 +833,13 @@ class TestMooncakeLayerwiseConnectorSchedulerMatchedTokens(unittest.TestCase):
         self.assertEqual(tokens, 4)
         self.assertTrue(async_flag)
 
+    def test_rejects_legacy_pcp_sharding(self):
+        config = MockVllmConfig()
+        config.parallel_config.prefill_context_parallel_size = 2
+
+        with self.assertRaisesRegex(NotImplementedError, "does not support MRV2 replicated PCP"):
+            MooncakeLayerwiseConnectorScheduler(config, MockKVCacheConfig(), "test_engine")
+
     def test_get_num_new_matched_tokens_hybrid_excludes_last_token(self):
         self.scheduler.need_truncate = True
         request = MockRequest("req1", prompt_token_ids=list(range(17)), kv_transfer_params={"do_remote_prefill": True})
@@ -1079,6 +1090,56 @@ class TestHelperFunctions(unittest.TestCase):
 
         hash3 = string_to_int64_hash("different_string")
         self.assertNotEqual(hash1, hash3)
+
+    def test_layerwise_block_mapping_uses_dcp_only(self):
+        p_parallel_info = parallel_info(tp_size=2, dcp_size=2, use_mla=True, pd_head_ratio=1)
+        d_parallel_info = parallel_info(tp_size=2, dcp_size=2, use_mla=True, pd_head_ratio=1)
+        req_meta = SimpleNamespace(
+            remote_cache_tokens=0,
+            local_block_ids=[[10, 11]],
+            remote_block_ids=[[20, 21]],
+        )
+
+        p_rank_blocks, d_block_ranks, pd_heads, d_send_counts = get_local_remote_block_port_mappings(
+            to_trans_idx=4,
+            p_parallel_info=p_parallel_info,
+            d_parallel_info=d_parallel_info,
+            d_hosts=["localhost"],
+            d_port=30000,
+            selected_p_cp_group=[0],
+            selected_d_cp_group=[0],
+            prompt_len=64,
+            block_size=16,
+            req_meta=req_meta,
+            total_num_kv_heads=1,
+            req_id="req",
+        )
+        transfers = get_transfer_mappings(
+            p_rank_blocks,
+            d_block_ranks,
+            pd_heads,
+            d_send_counts,
+            req_meta,
+            0,
+            p_parallel_info,
+            "req",
+            0,
+            4,
+            0,
+            0,
+        )
+
+        self.assertEqual(p_rank_blocks, [[[0, 2], [1, 3]]])
+        self.assertEqual(
+            transfers,
+            {
+                ("localhost", 30000): {
+                    "local_block_ids": [10, 11],
+                    "remote_block_ids": [20, 21],
+                    "trans_count": 1,
+                }
+            },
+        )
 
     def test_zmq_ctx_invalid_type(self):
         with self.assertRaises(ValueError), zmq_ctx("INVALID", "tcp://127.0.0.1:5555"):
@@ -1369,9 +1430,6 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
                 return_value=SimpleNamespace(pd_tp_ratio=1, num_head_replica=1, pd_head_ratio=1),
             ),
             patch(
-                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_pcp_group",
-            ),
-            patch(
                 "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_decode_context_model_parallel_rank",
                 return_value=0,
             ),
@@ -1411,6 +1469,12 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         self.assertEqual(len(worker.layer_metadata), 1)
         self.assertIsNotNone(worker.kv_send_layer_thread)
         self.assertIsNone(worker.kv_recv_layer_thread)
+
+    def test_worker_rejects_legacy_pcp_sharding(self):
+        self.vllm_config.parallel_config.prefill_context_parallel_size = 2
+
+        with self.assertRaisesRegex(NotImplementedError, "does not support MRV2 replicated PCP"):
+            MooncakeLayerwiseConnectorWorker(self.vllm_config, self.kv_cache_config, self.engine_id)
 
     def test_register_kv_caches_consumer(self):
         self.vllm_config.kv_transfer_config.is_kv_producer = False

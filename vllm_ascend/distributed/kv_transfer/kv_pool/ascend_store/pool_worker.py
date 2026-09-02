@@ -167,7 +167,9 @@ class KVPoolWorker:
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
-        cp_scale = self.pcp_size * self.dcp_size
+        # MRV2 PCP replicates the complete prompt KV cache on every PCP rank.
+        # Only DCP contributes to the logical KV block span.
+        cp_scale = self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
         requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
         if not isinstance(requested_hash_block_size, int):
@@ -213,12 +215,6 @@ class KVPoolWorker:
         else:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
-        self.my_key_index = (
-            self.pcp_rank * self.dcp_size * (self.tp_size // self.put_step)
-            + self.dcp_rank * (self.tp_size // self.put_step)
-            + self.head_or_tp_rank
-        )
-        self.num_ranks_per_layer = self.pcp_size * self.dcp_size * (self.tp_size // self.put_step)
 
         extra_cfg = self._extra_config
         tp_mismatch_info = infer_tp_mismatch_info(
