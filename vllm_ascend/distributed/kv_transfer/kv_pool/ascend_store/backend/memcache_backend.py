@@ -95,6 +95,11 @@ def make_full_key(
     block_hash_hex: str,
     head_or_tp_rank: int,
     num_groups: int,
+    *,
+    pcp_rank: int = 0,
+    dcp_rank: int = 0,
+    pcp_size: int = 1,
+    dcp_size: int = 1,
 ) -> str:
     """Full-block key for the layerwise transfer.
 
@@ -103,9 +108,12 @@ def make_full_key(
     (model@group_id@hash@rank) to distinguish groups.
     """
     if num_groups > 1:
-        return f"{model_name}@{group_id}@{block_hash_hex}@{head_or_tp_rank}"
+        base = f"{model_name}@{group_id}@{block_hash_hex}"
     else:
-        return f"{model_name}@{block_hash_hex}@{head_or_tp_rank}"
+        base = f"{model_name}@{block_hash_hex}"
+    if pcp_size * dcp_size > 1:
+        base += f"@pcp{pcp_rank}@dcp{dcp_rank}"
+    return f"{base}@{head_or_tp_rank}"
 
 
 def make_partial_key(
@@ -115,8 +123,20 @@ def make_partial_key(
     block_index: int,
     end_token: int,
     head_or_tp_rank: int,
+    *,
+    block_hash_hex: str | None = None,
+    pcp_rank: int = 0,
+    dcp_rank: int = 0,
+    pcp_size: int = 1,
+    dcp_size: int = 1,
 ) -> str:
-    return f"{model_name}@partial@{req_id}@{group_id}@{block_index}@{end_token}@{head_or_tp_rank}"
+    if block_hash_hex is not None:
+        base = f"{model_name}@partial@{group_id}@{block_hash_hex}@{end_token}"
+    else:
+        base = f"{model_name}@partial@{req_id}@{group_id}@{block_index}@{end_token}"
+    if pcp_size * dcp_size > 1:
+        base += f"@pcp{pcp_rank}@dcp{dcp_rank}"
+    return f"{base}@{head_or_tp_rank}"
 
 
 def make_hit_check_keys(
@@ -125,16 +145,30 @@ def make_hit_check_keys(
     block_hash_hex: str,
     num_ranks: int,
     num_groups: int,
+    *,
+    pcp_size: int = 1,
+    dcp_size: int = 1,
+    partial_end_token: int | None = None,
 ) -> list[str]:
     """All-rank keys for scheduler-side hit check.
 
     Returns one key per head_or_tp_rank (ranks in the same put_step
     group share one key for MLA).
     """
-    if num_groups > 1:
-        return [f"{model_name}@{group_id}@{block_hash_hex}@{h}" for h in range(num_ranks)]
-    else:
-        return [f"{model_name}@{block_hash_hex}@{h}" for h in range(num_ranks)]
+    keys = []
+    for pcp_rank in range(pcp_size):
+        for dcp_rank in range(dcp_size):
+            for head_or_tp_rank in range(num_ranks):
+                if partial_end_token is not None:
+                    base = f"{model_name}@partial@{group_id}@{block_hash_hex}@{partial_end_token}"
+                elif num_groups > 1:
+                    base = f"{model_name}@{group_id}@{block_hash_hex}"
+                else:
+                    base = f"{model_name}@{block_hash_hex}"
+                if pcp_size * dcp_size > 1:
+                    base += f"@pcp{pcp_rank}@dcp{dcp_rank}"
+                keys.append(f"{base}@{head_or_tp_rank}")
+    return keys
 
 
 class MemcacheBackend(Backend):

@@ -23,6 +23,12 @@ _PREFETCH_LAYERS = "layerwise_prefetch_layers"
 _INDEPENDENT_LAYERS = "layerwise_independent_layers"
 _DEFAULT_MAX_PREFETCH_LAYERS = 8
 _INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
+_DSV4_AUXILIARY_CACHE_SUFFIXES = (
+    ".compressor.state_cache",
+    _INDEXER_CACHE_SUFFIX,
+    ".indexer.compressor.state_cache",
+    ".swa_cache",
+)
 
 
 def get_layerwise_physical_layer_index(layer_name: str, base_layers: int) -> int:
@@ -220,6 +226,34 @@ def build_layerwise_reuse_layout(
     base_layout = build_layerwise_cache_layout(len(physical_layers), extra_config)
     independent_layers = [physical_layers[index] for index in base_layout.independent_layers]
     independent_layer_set = set(independent_layers)
+
+    if not base_layout.has_layer_reuse:
+        unshared_layer_cache_specs: dict[int, LayerwiseLayerCacheSpecs] = {}
+        for physical_layer, named_specs in named_specs_by_layer.items():
+            if len(named_specs) == 1:
+                main_spec = named_specs[0]
+            else:
+                main_specs = [spec for spec in named_specs if spec.layer_name.endswith(".attn")]
+                auxiliary_specs = [
+                    spec for spec in named_specs if spec.layer_name.endswith(_DSV4_AUXILIARY_CACHE_SUFFIXES)
+                ]
+                if len(main_specs) != 1 or len(main_specs) + len(auxiliary_specs) != len(named_specs):
+                    raise ValueError(
+                        f"Physical layer {physical_layer} with multiple cache specs "
+                        "must have exactly one attention main spec and only supported "
+                        f"DeepSeek-V4 auxiliary specs {_DSV4_AUXILIARY_CACHE_SUFFIXES}; "
+                        f"got {[spec.layer_name for spec in named_specs]}."
+                    )
+                main_spec = main_specs[0]
+            unshared_layer_cache_specs[physical_layer] = LayerwiseLayerCacheSpecs(main=main_spec)
+        return LayerwiseReuseLayout(
+            layer_cache_specs=unshared_layer_cache_specs,
+            buffer_slots=tuple((physical_layer,) for physical_layer in physical_layers),
+            prefetch_layer_map={},
+            independent_layers=independent_layers,
+            num_prefetch_layers=base_layout.num_prefetch_layers,
+            has_layer_reuse=False,
+        )
 
     layer_cache_specs: dict[int, LayerwiseLayerCacheSpecs] = {}
     for physical_layer, named_specs in named_specs_by_layer.items():

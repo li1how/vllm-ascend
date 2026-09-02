@@ -1006,11 +1006,12 @@ class KVPoolWorker:
                 block_size,
                 self.hash_block_size,
             )
+            partial_token_count = request.target_token_len if self.layerwise_offload else request.save_end_token
             partial_block_index = get_partial_block_index(
-                request.target_token_len,
+                partial_token_count,
                 block_size,
                 len(group_block_hashes),
-                self.layerwise_offload,
+                self.layerwise_offload or self.use_layerwise_transfer,
             )
             # Skip blocks that are hit in the KV pool — their KV is already
             # in the pool (loaded via load_prepare), so re-saving would write
@@ -1023,7 +1024,9 @@ class KVPoolWorker:
                 )
                 hit_full_blocks = pool_hit_tokens // block_size
                 save_start_block = max(save_start_block, hit_full_blocks)
-            if partial_block_index is None:
+                if pool_hit_tokens >= partial_token_count:
+                    partial_block_index = None
+            if partial_block_index is None and self.layerwise_offload:
                 partial_block_index = request.partial_block_index
             if save_start_block >= save_end_block and partial_block_index is None:
                 continue
@@ -1086,9 +1089,9 @@ class KVPoolWorker:
                 cached_tokens,
                 block_size,
                 len(group_block_hashes),
-                self.layerwise_offload,
+                self.layerwise_offload or self.use_layerwise_transfer,
             )
-            if not self.layerwise_offload or layer_id in self.independent_layers:
+            if self.layerwise_offload and layer_id in self.independent_layers:
                 partial_block_index = None
             partial_gva = (
                 request.partial_load_gva_per_group[group_id]
@@ -1133,6 +1136,10 @@ class KVPoolWorker:
             block_hash_hex,
             self.head_or_tp_rank,
             self.num_kv_cache_groups,
+            pcp_rank=self.pcp_rank,
+            dcp_rank=self.dcp_rank,
+            pcp_size=self.pcp_size,
+            dcp_size=self.dcp_size,
         )
 
     def _make_layerwise_partial_key(
@@ -1142,6 +1149,10 @@ class KVPoolWorker:
         block_index: int,
         end_token: int,
     ) -> str:
+        hash_index = end_token // self.hash_block_size - 1
+        block_hash_hex = None
+        if end_token > 0 and end_token % self.hash_block_size == 0 and hash_index < len(request.block_hashes):
+            block_hash_hex = block_hash_to_str(request.block_hashes[hash_index])
         return self.layerwise_protocol.make_partial_key(
             self.model_name,
             request.req_id,
@@ -1149,6 +1160,11 @@ class KVPoolWorker:
             block_index,
             end_token,
             self.head_or_tp_rank,
+            block_hash_hex=block_hash_hex,
+            pcp_rank=self.pcp_rank,
+            dcp_rank=self.dcp_rank,
+            pcp_size=self.pcp_size,
+            dcp_size=self.dcp_size,
         )
 
     def _refresh_allocated_gvas(self, keys: list[str]) -> None:
@@ -1268,21 +1284,29 @@ class KVPoolWorker:
                             self._allocated_gvas[key] = gva
                             all_group_save_keys.append(key)
 
+                partial_token_count = request.target_token_len if self.layerwise_offload else request.save_end_token
                 partial_block_index = get_partial_block_index(
-                    request.target_token_len,
+                    partial_token_count,
                     effective_block_size,
                     len(group_block_hashes),
-                    self.layerwise_offload,
+                    self.layerwise_offload or self.use_layerwise_transfer,
                 )
                 if partial_block_index is not None and partial_block_index < len(block_ids_by_group):
                     partial_key = self._make_layerwise_partial_key(
                         request,
                         group_id,
                         partial_block_index,
-                        request.target_token_len,
+                        partial_token_count,
                     )
-                    partial_gva = self._allocated_gvas.get(partial_key)
-                    if partial_gva is None:
+                    pool_hit_tokens = 0
+                    if request.load_spec is not None and request.load_spec.can_load:
+                        pool_hit_tokens = (
+                            request.load_spec.kvpool_store_skip_tokens
+                            if request.load_spec.kvpool_store_skip_tokens is not None
+                            else request.load_spec.kvpool_cached_tokens
+                        )
+                    partial_gva = 0
+                    if pool_hit_tokens < partial_token_count:
                         allocated = self.m_store.batch_alloc(
                             [partial_key],
                             [alloc_size],
@@ -1299,8 +1323,13 @@ class KVPoolWorker:
                                 partial_block_index,
                                 partial_gva,
                             )
-                    # Partial keys are request-scoped; do not retain them forever.
-                    self._allocated_gvas.pop(partial_key, None)
+                    is_content_addressed = (
+                        partial_token_count > 0
+                        and partial_token_count % self.hash_block_size == 0
+                        and partial_token_count // self.hash_block_size <= len(request.block_hashes)
+                    )
+                    if not is_content_addressed:
+                        self._allocated_gvas.pop(partial_key, None)
                     request.partial_save_gva_per_group[group_id] = partial_gva
 
                 logger.debug(
@@ -1390,7 +1419,7 @@ class KVPoolWorker:
                     cached_tokens,
                     effective_block_size,
                     len(group_block_hashes),
-                    self.layerwise_offload,
+                    self.use_layerwise_transfer,
                 )
                 if partial_block_index is not None and (
                     partial_block_index < load_start_block or partial_block_index >= full_len
@@ -1654,7 +1683,7 @@ class KVPoolWorker:
             if not self.layer_load_tasks[layer_id] and reuse_source is None:
                 return False
             attention_start_gate = None
-            if self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
+            if self.layerwise_offload and self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
                 attention_start_gate = get_attention_compute_start_gate()
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]

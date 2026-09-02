@@ -990,6 +990,7 @@ class ReqMeta:
         original_block_size: list[int] | int | None = None,
         kv_cache_group_families: list[str] | None = None,
         save_partial_block: bool = False,
+        content_addressed_partial_block: bool = False,
         hash_block_size: int | None = None,
     ) -> ReqMeta | None:
         """Create the request metadata from a request tracker."""
@@ -1006,13 +1007,13 @@ class ReqMeta:
             if discard_partial_chunks
             else 0
         )
+        hash_block_size = hash_block_size or cache_transfer_granularity
+        assert cache_transfer_granularity % hash_block_size == 0
         num_tokens_to_save = (
             (target_token_len // cache_transfer_granularity * cache_transfer_granularity)
             if discard_partial_chunks
             else target_token_len
         )
-        hash_block_size = hash_block_size or cache_transfer_granularity
-        assert cache_transfer_granularity % hash_block_size == 0
         # Request hashes use hash_block_size, which may be finer than the
         # transfer granularity used to advance num_saved_tokens.
         hashes_per_transfer_block = cache_transfer_granularity // hash_block_size
@@ -1025,6 +1026,14 @@ class ReqMeta:
         )
         if boundary_without_hash:
             num_tokens_to_save = available_full_block_count * cache_transfer_granularity
+        if content_addressed_partial_block and discard_partial_chunks:
+            # The MemCache GVA path can persist a partially filled cache-group
+            # block.  Use the last available content-addressable hash boundary
+            # rather than dropping every prefix shorter than the hybrid LCM.
+            num_tokens_to_save = max(
+                num_tokens_to_save,
+                min(target_token_len // hash_block_size, len(block_hashes)) * hash_block_size,
+            )
         if tracker.last_block_gva is not None and (
             target_token_len % cache_transfer_granularity != 0 or boundary_without_hash
         ):
@@ -1034,8 +1043,16 @@ class ReqMeta:
         else:
             partial_block_index = None
 
-        should_save_partial_block = save_partial_block and (
-            target_token_len % cache_transfer_granularity != 0 or boundary_without_hash
+        partial_boundary_advanced = num_tokens_to_save > previous_saved_tokens
+        if content_addressed_partial_block and not partial_boundary_advanced:
+            # A hash-addressed partial block is immutable.  Once this hash
+            # boundary has been saved, later tokens in the same transfer block
+            # must wait for the next hash instead of allocating the same key.
+            partial_block_index = None
+        should_save_partial_block = (
+            save_partial_block
+            and (not content_addressed_partial_block or partial_boundary_advanced)
+            and (target_token_len % cache_transfer_granularity != 0 or boundary_without_hash)
         )
         skip_save = skip_save or (
             num_tokens_to_save < chunk_boundary and partial_block_index is None and not should_save_partial_block

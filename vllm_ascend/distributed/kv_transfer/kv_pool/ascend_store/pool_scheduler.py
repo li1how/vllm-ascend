@@ -311,7 +311,12 @@ class KVPoolScheduler:
         num_hit_blocks = query_start_block + num_queried_hit_blocks
         return num_hit_blocks * self._block_size
 
-    def _make_layerwise_hit_check_keys(self, group_id: int, block_hash_hex: str) -> list[str]:
+    def _make_layerwise_hit_check_keys(
+        self,
+        group_id: int,
+        block_hash_hex: str,
+        partial_end_token: int | None = None,
+    ) -> list[str]:
         """All-rank keys for scheduler-side hit check, built by the
         backend's protocol module.
 
@@ -326,6 +331,9 @@ class KVPoolScheduler:
             block_hash_hex,
             head_or_tp_ranks,
             len(self.kv_cache_group_ids),
+            pcp_size=self.pcp_size,
+            dcp_size=self.dcp_size,
+            partial_end_token=partial_end_token,
         )
 
     def _get_layerwise_hit_tokens(
@@ -336,8 +344,13 @@ class KVPoolScheduler:
     ) -> int:
         # In layerwise mode, always query from block 0 because the remote
         # pool stores per-layer data that may not match local prefix cache.
+        token_len = token_len // self.hash_block_size * self.hash_block_size
+        if token_len == 0:
+            return 0
         num_hash_blocks = token_len // self.hash_block_size
         block_hashes_to_check = request.block_hashes[:num_hash_blocks]
+        if len(block_hashes_to_check) < num_hash_blocks:
+            return 0
         hits_per_group: list[int] = []
         self._get_or_create_request_tracker(request.request_id)
 
@@ -352,6 +365,19 @@ class KVPoolScheduler:
             keys_by_block = [
                 self._make_layerwise_hit_check_keys(group_id, block_hash_to_str(bh)) for bh in group_block_hashes
             ]
+            block_end_tokens = [
+                (query_start_block + block_index + 1) * effective_block_size
+                for block_index in range(len(group_block_hashes))
+            ]
+            if token_len % effective_block_size:
+                keys_by_block.append(
+                    self._make_layerwise_hit_check_keys(
+                        group_id,
+                        block_hash_to_str(block_hashes_to_check[-1]),
+                        partial_end_token=token_len,
+                    )
+                )
+                block_end_tokens.append(token_len)
             all_keys = [key for block_keys in keys_by_block for key in block_keys]
             if not all_keys:
                 continue
@@ -367,17 +393,17 @@ class KVPoolScheduler:
                 continue
 
             # A block is hit only when ALL ranks' keys return valid GVA
-            num_hit_blocks = 0
+            hit_tokens = 0
             offset = 0
-            for block_keys in keys_by_block:
+            for block_keys, block_end_token in zip(keys_by_block, block_end_tokens):
                 block_infos = key_infos[offset : offset + len(block_keys)]
                 offset += len(block_keys)
                 if all(ki.size() and ki.size() > 0 for ki in block_infos):
-                    num_hit_blocks += 1
+                    hit_tokens = block_end_token
                 else:
                     break
 
-            hits_per_group.append((query_start_block + num_hit_blocks) * effective_block_size)
+            hits_per_group.append(hit_tokens)
 
         if not hits_per_group:
             logger.debug(
@@ -627,6 +653,8 @@ class KVPoolScheduler:
         )
 
     def _get_last_chunk_tokens_num(self, prompt_token_ids: list[int]) -> int:
+        if self.use_layerwise_transfer:
+            return len(prompt_token_ids) // self.hash_block_size * self.hash_block_size
         if self._discard_partial_chunks:
             return self._floor_to_cache_transfer_granularity(len(prompt_token_ids))
         return len(prompt_token_ids)
@@ -650,7 +678,11 @@ class KVPoolScheduler:
             discard_partial_chunks=self._discard_partial_chunks,
             original_block_size=self.original_block_size,
             kv_cache_group_families=self.kv_cache_group_families,
-            save_partial_block=self.layerwise_offload,
+            save_partial_block=self.use_layerwise_transfer,
+            # Buffer-reuse mode must persist each request-scoped in-flight
+            # snapshot.  Without reuse, partial snapshots are immutable and
+            # only advance when a new content hash becomes available.
+            content_addressed_partial_block=self.use_layerwise_transfer and not self.layerwise_offload,
             hash_block_size=self.hash_block_size,
         )
 
