@@ -1774,15 +1774,17 @@ class MooncakeConnectorScheduler:
         block_size = getattr(group.kv_cache_spec, "block_size", getattr(first_spec, "block_size", self.block_size))
         is_state_group = any(isinstance(spec, MambaSpec) for spec in specs)
         sliding_window = 0
-        compress_ratio = 1
         for spec in specs:
             if isinstance(spec, SlidingWindowSpec):
                 sliding_window = spec.sliding_window
-            elif hasattr(spec, "compress_ratio"):
-                compress_ratio = spec.compress_ratio
 
         return GroupTransferInfo(
-            tokens_per_block=block_size * max(1, int(compress_ratio)),
+            # KVCacheSpec.block_size is always expressed in logical input
+            # tokens.  Compressed DSV4 specs already expose
+            # ``storage_block_size * compress_ratio`` as block_size, so
+            # applying compress_ratio again would square the compression and
+            # truncate valid tail blocks during P->D transfer.
+            tokens_per_block=block_size,
             blocks_per_window=cdiv(sliding_window, block_size) + 1 if sliding_window else 0,
             is_state_group=is_state_group,
         )
@@ -2071,6 +2073,32 @@ class MooncakeConnectorScheduler:
         """Build host mapping for one DP group that may span multiple nodes."""
         if not metadata:
             return
+
+        # ``cache_config.block_size`` is rewritten by EngineCore after hybrid
+        # KV-cache planning to the smallest scheduler-visible group block size.
+        # DeepSeek-V4, for example, changes it from the worker page size (32)
+        # to the compressor-state granularity (2).  Mooncake's CP block/rank
+        # mapping operates on worker pages, not on that scheduler granularity.
+        # Recover the page size from the worker handshake, which is produced
+        # before EngineCore performs the rewrite, and require all local ranks
+        # to agree on it.
+        worker_block_sizes = {
+            int(block_size)
+            for rank_metadata in metadata.values()
+            if (block_size := getattr(rank_metadata, "block_size", 0))
+        }
+        if len(worker_block_sizes) > 1:
+            raise ValueError(f"Mooncake workers must use one KV page size, got {sorted(worker_block_sizes)}.")
+        if worker_block_sizes:
+            worker_block_size = worker_block_sizes.pop()
+            if worker_block_size != self.block_size:
+                logger.info(
+                    "Mooncake scheduler KV block size adjusted from %d to "
+                    "worker page size %d after hybrid KV-cache planning.",
+                    self.block_size,
+                    worker_block_size,
+                )
+                self.block_size = worker_block_size
 
         updated_mapping: dict[str, dict[str, Any]] = {}
         kv_port = self.vllm_config.kv_transfer_config.kv_port
@@ -2889,16 +2917,33 @@ class MooncakeConnectorWorker:
         """
         prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
 
-        if self.pcp_size > 1 or meta.remote_pcp_size > 1:
-            raise NotImplementedError("Mooncake PCP transfer requires replicated MRV2 PCP support.")
+        uses_pcp_replicas = self.pcp_size > 1 or meta.remote_pcp_size > 1
+        if uses_pcp_replicas and self.pcp_size != meta.remote_pcp_size:
+            raise ValueError(
+                "Mooncake replicated PCP transfer requires matching P/D PCP sizes: "
+                f"local_pcp_size={self.pcp_size}, remote_pcp_size={meta.remote_pcp_size}."
+            )
+        if uses_pcp_replicas and (self.dcp_size > 1 or meta.remote_dcp_size > 1):
+            raise NotImplementedError(
+                "Mooncake MRV2 replicated PCP transfer does not yet support "
+                f"DCP: local_dcp_size={self.dcp_size}, remote_dcp_size={meta.remote_dcp_size}."
+            )
 
-        if meta.remote_dcp_size * self.dcp_size == 1:
+        # MRV2 PCP ranks contain a complete copy of prompt KV.  Select one
+        # matching remote PCP replica for each local PCP rank and otherwise use
+        # the regular (non-context-sharded) block mapping.  Keeping the replica
+        # index in the port distributes receives one-to-one across P workers,
+        # so every P worker observes completion and can release its blocks.
+        uses_context_sharded_kv = self.dcp_size * meta.remote_dcp_size > 1
+        if not uses_context_sharded_kv:
             if self._is_hma_required:
                 chosen_rank_list, _ = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
             else:
                 chosen_rank_list = self._get_remote_rank(req_id, prefill_tp_size)
 
-            remote_handshake_port_list = [[x + meta.remote_port for x in chosen_rank_list]]
+            remote_pcp_rank = self.pcp_rank if uses_pcp_replicas else 0
+            remote_replica_port = meta.remote_port + remote_pcp_rank * prefill_tp_size
+            remote_handshake_port_list = [[x + remote_replica_port for x in chosen_rank_list]]
             # No CP: expand logical blocks into kernel blocks here so the transfer
             # stage consumes kernel-level ids directly (chunk_starts no longer needed).
             use_transfer_group_block_ids = transfer_groups_need_independent_block_ids(
@@ -3346,7 +3391,10 @@ class MooncakeConnectorWorker:
                 # Non-CP case: port = base + chosen_rank, which has a one-to-one correspondence
                 # with the table keys, maintaining the original logic.
                 _, rank_group_pulls = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
-                return [[rank_group_pulls[p - remote_base_port] for p in ports] for ports in remote_handshake_port_list]
+                return [
+                    [rank_group_pulls[(p - remote_base_port) % prefill_tp_size] for p in ports]
+                    for ports in remote_handshake_port_list
+                ]
 
             # CP case: `group_pulls` is derived from `port` (which already includes the random selection result),
             # eliminating the need for a table lookup.
@@ -3705,14 +3753,14 @@ class MooncakeConnectorWorker:
                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,
                     )
 
-        if self.kv_send_thread is not None and self.pcp_size == 1 and self.dcp_size == 1:
+        if self.kv_send_thread is not None and self.dcp_size == 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():
                 if self.tp_rank in self._prefill_get_remote_rank(req_id):
                     self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
                 else:
                     self.kv_send_thread.add_not_transfer_request(req_id)
 
-        if self.kv_send_thread is not None and (self.pcp_size > 1 or self.dcp_size > 1):
+        if self.kv_send_thread is not None and self.dcp_size > 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():
                 self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
 
