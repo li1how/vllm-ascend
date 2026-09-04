@@ -579,6 +579,7 @@ class KVCacheRecvingThread(threading.Thread):
         shard_idx: int = 0,
         local_block_ids_replicate_k: BlockIds | None = None,
         remote_block_ids_replicate_k: BlockIds | None = None,
+        remote_pcp_cleanup_ports: dict[int, str] | None = None,
     ):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
@@ -599,6 +600,7 @@ class KVCacheRecvingThread(threading.Thread):
             "all_task_done": all_task_done,
             "shard_idx": shard_idx,
             "remote_block_size": remote_block_size,
+            "remote_pcp_cleanup_ports": remote_pcp_cleanup_ports or {},
         }
         logger.debug("Adding request %s to the queue.Trans info:%s", request_id, trans_info)
         self.request_queue.put(trans_info)
@@ -760,11 +762,24 @@ class KVCacheRecvingThread(threading.Thread):
                     self.proc_not_transfer_request.pop(remote_request_id, None)
                 self._clear_failed_recv_request(request_id)
             self.request_queue.task_done()
+            self._send_done_signals_to_unused_pcp_replicas(
+                remote_request_id,
+                req_meta.get("remote_pcp_cleanup_ports", {}),
+            )
             self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
             # Always send the done signal to the remote host to ensure proper
             # resource cleanup. Failing to do so may cause a memory leak on the
             # remote host.
             self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
+
+    def _send_done_signals_to_unused_pcp_replicas(
+        self,
+        request_id: str,
+        remote_pcp_cleanup_ports: dict[int, str],
+    ) -> None:
+        """Release P-side PCP replicas that were not selected by this D request."""
+        for remote_port, remote_host in remote_pcp_cleanup_ports.items():
+            self._send_done_recv_signal(request_id, remote_host, remote_port, {})
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
@@ -1819,7 +1834,6 @@ class MooncakeConnectorScheduler:
         assert len(block_ids) == len(self.group_transfer_info), "Number of KV cache groups must match"
 
         transfer_block_ids = []
-        cp_size = max(1, self.pcp_size * self.dcp_size)
         for blocks, group_info in zip(block_ids, self.group_transfer_info):
             is_aligned_state_group = group_info.is_state_group and (
                 getattr(self.vllm_config.cache_config, "mamba_cache_mode", None) == "align"
@@ -1827,9 +1841,9 @@ class MooncakeConnectorScheduler:
             if group_info.is_state_group and not is_aligned_state_group:
                 transfer_block_ids.append(blocks)
             elif is_aligned_state_group:
-                # Mamba state is not CP-sharded like attention KV. Its aligned
+                # Mamba state is not DCP-sharded like attention KV. Its aligned
                 # block index is derived from the actual (already truncated)
-                # prompt length, without multiplying by the CP size.
+                # prompt length, without multiplying by the DCP size.
                 num_prompt_state_blocks = cdiv(prompt_len, group_info.tokens_per_block)
                 if num_prompt_state_blocks <= 0 or num_prompt_state_blocks > len(blocks):
                     raise RuntimeError(
@@ -1839,10 +1853,9 @@ class MooncakeConnectorScheduler:
                     )
                 transfer_block_ids.append(blocks[num_prompt_state_blocks - 1 : num_prompt_state_blocks])
             else:
-                # In context parallelism, each scheduler-visible block id is a
-                # CP-grouped/virtual block shared by all CP ranks. It therefore
-                # covers cp_size times the token span of one no-CP block.
-                num_prompt_blocks = cdiv(prompt_len, group_info.tokens_per_block * cp_size)
+                # Each scheduler-visible block id is a DCP-grouped virtual
+                # block shared by all DCP ranks.
+                num_prompt_blocks = cdiv(prompt_len, group_info.tokens_per_block * self.dcp_size)
                 transfer_block_ids.append(blocks[:num_prompt_blocks])
         return tuple(transfer_block_ids)
 
@@ -2895,13 +2908,38 @@ class MooncakeConnectorWorker:
         """
         prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
 
-        if meta.remote_pcp_size * meta.remote_dcp_size * self.pcp_size * self.dcp_size == 1:
+        uses_pcp_replicas = self.pcp_size > 1 or meta.remote_pcp_size > 1
+        if self.pcp_size > 1 and self.pcp_size != meta.remote_pcp_size:
+            raise ValueError(
+                "Mooncake decode-side PCP requires matching P/D PCP sizes: "
+                f"local_pcp_size={self.pcp_size}, remote_pcp_size={meta.remote_pcp_size}."
+            )
+        if uses_pcp_replicas and (self.dcp_size > 1 or meta.remote_dcp_size > 1):
+            raise NotImplementedError(
+                "Mooncake MRV2 replicated PCP transfer does not yet support "
+                f"DCP: local_dcp_size={self.dcp_size}, remote_dcp_size={meta.remote_dcp_size}."
+            )
+        uses_replicated_pcp = uses_pcp_replicas
+
+        if uses_replicated_pcp or meta.remote_pcp_size * meta.remote_dcp_size * self.pcp_size * self.dcp_size == 1:
             if self._is_hma_required:
                 chosen_rank_list, _ = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
             else:
                 chosen_rank_list = self._get_remote_rank(req_id, prefill_tp_size)
 
-            remote_handshake_port_list = [[x + meta.remote_port for x in chosen_rank_list]]
+            remote_pcp_rank = self._get_remote_pcp_rank(req_id, meta.remote_pcp_size)
+            remote_handshake_port_list = [
+                [
+                    self._get_remote_pcp_port(
+                        meta.remote_port,
+                        remote_rank,
+                        prefill_tp_size,
+                        meta.remote_pcp_size,
+                        remote_pcp_rank,
+                    )
+                    for remote_rank in chosen_rank_list
+                ]
+            ]
             # No CP: expand logical blocks into kernel blocks here so the transfer
             # stage consumes kernel-level ids directly (chunk_starts no longer needed).
             use_transfer_group_block_ids = transfer_groups_need_independent_block_ids(
@@ -3372,13 +3410,17 @@ class MooncakeConnectorWorker:
             this pull is the final pull for the group. The final-pull flag is
             used by the receiver to decide when group reformatting can run.
         """
-        cp_transfer = remote_pcp_size * remote_dcp_size * self.pcp_size * self.dcp_size > 1
+        uses_replicated_pcp = self._uses_replicated_pcp(remote_pcp_size, remote_dcp_size)
+        cp_transfer = remote_pcp_size * remote_dcp_size * self.pcp_size * self.dcp_size > 1 and not uses_replicated_pcp
         if self._is_hma_required:
             if not cp_transfer:
                 # Non-CP case: port = base + chosen_rank, which has a one-to-one correspondence
                 # with the table keys, maintaining the original logic.
                 _, rank_group_pulls = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
-                return [[rank_group_pulls[p - remote_base_port] for p in ports] for ports in remote_handshake_port_list]
+                return [
+                    [rank_group_pulls[(p - remote_base_port) % prefill_tp_size] for p in ports]
+                    for ports in remote_handshake_port_list
+                ]
 
             # CP case: `group_pulls` is derived from `port` (which already includes the random selection result),
             # eliminating the need for a table lookup.
@@ -3589,8 +3631,9 @@ class MooncakeConnectorWorker:
                 f"Got remote groups={len(meta.remote_block_ids)}, local groups={len(meta.local_block_ids)}."
             )
 
-        remote_cp_size = meta.remote_pcp_size * meta.remote_dcp_size
-        local_cp_size = self.pcp_size * self.dcp_size
+        uses_replicated_pcp = self._uses_replicated_pcp(meta.remote_pcp_size, meta.remote_dcp_size)
+        remote_cp_size = meta.remote_dcp_size if uses_replicated_pcp else meta.remote_pcp_size * meta.remote_dcp_size
+        local_cp_size = self.dcp_size if uses_replicated_pcp else self.pcp_size * self.dcp_size
         if local_cp_size == 0 or remote_cp_size % local_cp_size != 0:
             raise AssertionError(
                 f"SFA replicate-K expects remote cp size({remote_cp_size}) to be divisible by "
@@ -3695,6 +3738,11 @@ class MooncakeConnectorWorker:
                 meta.remote_pcp_size,
                 meta.remote_dcp_size,
             )
+            remote_pcp_cleanup_ports = self._get_remote_pcp_cleanup_ports(
+                remote_req_id,
+                meta,
+                prefill_tp_size,
+            )
 
             for pcp_dcp_rank, remote_ports in enumerate(remote_handshake_port_list):
                 for remote_tp_offset, remote_handshake_port in enumerate(remote_ports):
@@ -3706,9 +3754,13 @@ class MooncakeConnectorWorker:
                         meta.remote_engine_id,
                         meta.remote_multi_nodes_meta_mapping,
                     )
+                    uses_replicated_pcp = self._uses_replicated_pcp(
+                        meta.remote_pcp_size,
+                        meta.remote_dcp_size,
+                    )
                     remote_port_send_num = (
                         self.remote_port_send_num[meta.remote_engine_id]
-                        if meta.remote_pcp_size * meta.remote_dcp_size > 1
+                        if meta.remote_pcp_size * meta.remote_dcp_size > 1 and not uses_replicated_pcp
                         else None
                     )
                     local_block_ids_replicate_k_for_port = (
@@ -3740,16 +3792,19 @@ class MooncakeConnectorWorker:
                         remote_block_size=meta.remote_block_size,
                         local_block_ids_replicate_k=local_block_ids_replicate_k_for_port,
                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,
+                        remote_pcp_cleanup_ports=(
+                            remote_pcp_cleanup_ports if pcp_dcp_rank == 0 and remote_tp_offset == 0 else None
+                        ),
                     )
 
-        if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:
+        if self.kv_send_thread is not None and self.dcp_size == 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():
                 if self.tp_rank in self._prefill_get_remote_rank(req_id):
                     self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
                 else:
                     self.kv_send_thread.add_not_transfer_request(req_id)
 
-        if self.kv_send_thread is not None and self.pcp_size * self.dcp_size > 1:
+        if self.kv_send_thread is not None and self.dcp_size > 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():
                 self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
 
@@ -3767,6 +3822,67 @@ class MooncakeConnectorWorker:
             num_p_block_heads = max(1, self.num_key_value_heads // prefill_tp_size)
             tp_num_need_pulls = num_d_block_heads // num_p_block_heads
         return tp_num_need_pulls
+
+    def _uses_replicated_pcp(self, remote_pcp_size: int, remote_dcp_size: int) -> bool:
+        return remote_pcp_size > 1 and self.pcp_size in (1, remote_pcp_size) and self.dcp_size == remote_dcp_size == 1
+
+    def _get_remote_pcp_rank(self, req_id: str, remote_pcp_size: int) -> int:
+        if remote_pcp_size == 1 or self.pcp_size > 1:
+            return self.pcp_rank
+        # A D node without PCP needs only one of the complete P-side PCP replicas.
+        return random.Random(string_to_int64_hash(req_id)).randrange(remote_pcp_size)
+
+    @staticmethod
+    def _get_remote_pcp_port(
+        remote_base_port: int,
+        remote_rank: int,
+        prefill_tp_size: int,
+        remote_pcp_size: int,
+        remote_pcp_rank: int,
+    ) -> int:
+        remote_pp_rank, remote_tp_rank = divmod(remote_rank, prefill_tp_size)
+        return remote_base_port + (
+            (remote_pp_rank * remote_pcp_size + remote_pcp_rank) * prefill_tp_size + remote_tp_rank
+        )
+
+    def _get_remote_pcp_cleanup_ports(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        prefill_tp_size: int,
+    ) -> dict[int, str]:
+        if (
+            self.tp_rank != 0
+            or self.pcp_size != 1
+            or not self._uses_replicated_pcp(meta.remote_pcp_size, meta.remote_dcp_size)
+        ):
+            return {}
+
+        # Only D TP0 notifies the P sender ranks selected by the normal TP
+        # routing on every unused PCP replica, so each P worker can release it.
+        selected_pcp_rank = self._get_remote_pcp_rank(req_id, meta.remote_pcp_size)
+        selected_remote_ranks = self._prefill_get_remote_rank(req_id)
+        cleanup_ports: dict[int, str] = {}
+        for remote_pcp_rank in range(meta.remote_pcp_size):
+            if remote_pcp_rank == selected_pcp_rank:
+                continue
+            for remote_rank in selected_remote_ranks:
+                remote_port = self._get_remote_pcp_port(
+                    meta.remote_port,
+                    remote_rank,
+                    prefill_tp_size,
+                    meta.remote_pcp_size,
+                    remote_pcp_rank,
+                )
+                remote_host, _ = self._get_remote_host_info_by_port(
+                    meta.remote_port,
+                    remote_port,
+                    meta.remote_host,
+                    meta.remote_engine_id,
+                    meta.remote_multi_nodes_meta_mapping,
+                )
+                cleanup_ports[remote_port] = remote_host
+        return cleanup_ports
 
     def _get_remote_host_info_by_port(
         self,
