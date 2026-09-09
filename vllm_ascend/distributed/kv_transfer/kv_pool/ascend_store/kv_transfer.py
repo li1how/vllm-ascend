@@ -872,6 +872,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         group_uses_align_state: list[bool] | None = None,
         enable_kv_event: bool = False,
         worker: Any = None,
+        *,
+        is_writer: bool = True,
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, tp_size, dcp_size, ready_event, name="KVCacheSendingThread"
@@ -883,6 +885,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.completed_events_lock = threading.Lock()
         self.completed_events: dict[int, int] = {}
         self.worker = worker
+        self.is_writer = is_writer
 
     def is_stored_request(self, req_id: str) -> bool:
         with self.done_task_lock:
@@ -914,7 +917,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.request_queue.task_done()
 
     def _handle_request(self, req_meta: ReqMeta):
-        if self.worker is not None and getattr(self.worker, "tp_mismatch", False):
+        if self.is_writer and self.worker is not None and getattr(self.worker, "tp_mismatch", False):
             req_id = req_meta.req_id
             try:
                 self.worker._store_kv_tp_mismatch(req_meta)
@@ -938,7 +941,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 tracked_request = req_id in self.stored_requests
             if not tracked_request:
                 return
-            self._handle_stored_request(req_meta)
+            # Non-writing PCP replicas still complete every queued request and
+            # event through the same finally block, including TP-mismatch saves.
+            if self.is_writer:
+                self._handle_stored_request(req_meta)
         except Exception:
             logger.exception("Failed to store KV cache for request %s", req_id)
         finally:

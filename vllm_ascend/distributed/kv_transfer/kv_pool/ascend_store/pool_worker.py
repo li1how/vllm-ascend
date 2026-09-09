@@ -163,6 +163,8 @@ class KVPoolWorker:
     def _init_kv_transfer_config(self, vllm_config, extra_config, use_layerwise, kv_cache_config) -> None:
         self._extra_config = extra_config
         self.use_layerwise = use_layerwise
+        if self.pcp_size > 1 and self.use_layerwise:
+            raise NotImplementedError("AscendStore PCP cache sharing requires use_layerwise=False.")
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = extra_config.get("load_async", False)
         self._invalid_block_ids: set[int] = set()
@@ -189,7 +191,8 @@ class KVPoolWorker:
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
-        cp_scale = self.pcp_size * self.dcp_size
+        # PCP replicates KV; only DCP expands the logical block span.
+        cp_scale = self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
         requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
         if not isinstance(requested_hash_block_size, int):
@@ -322,7 +325,7 @@ class KVPoolWorker:
                 KeyMetadata(
                     model_config.model.rstrip("/").split("/")[-1],
                     group_tp_rank,
-                    self.pcp_rank,
+                    0,  # All PCP replicas share the PCP=1 key namespace.
                     self.dcp_rank,
                     self.pp_rank,
                     group_id,
@@ -631,6 +634,7 @@ class KVPoolWorker:
                     self.group_uses_align_state,
                     self.enable_kv_events,
                     worker=self if self.tp_mismatch else None,
+                    is_writer=self.pcp_rank == 0,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -2729,7 +2733,7 @@ class KVPoolWorker:
         return f"{key[:value_start]}{value}{key[value_end:]}"
 
     def _expand_lookup_keys_by_rank(self, keys: list[str], group_id: int) -> list[str]:
-        # All-rank KV pool lookup currently assumes PCP=1.
+        # PCP replicas share keys; expand only the physical KV partitions.
         expanded: list[str] = []
         num_head_or_tp_ranks = self.get_group_tp_size(group_id)
         # Keep each rank shard's block/layer keys contiguous to match
