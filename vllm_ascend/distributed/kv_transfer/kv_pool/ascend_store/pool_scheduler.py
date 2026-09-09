@@ -115,6 +115,8 @@ class KVPoolScheduler:
         self.load_specs: dict[str, LoadSpec] = {}
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
+        if self.pcp_size > 1 and self.use_layerwise:
+            raise NotImplementedError("AscendStore PCP cache sharing requires use_layerwise=False.")
 
         self.mamba_group_ids = self._infer_mamba_groups()
         self.num_speculative_blocks = (
@@ -124,7 +126,8 @@ class KVPoolScheduler:
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
-        cp_scale = self.pcp_size * self.dcp_size
+        # PCP replicates KV; only DCP expands the logical block span.
+        cp_scale = self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
         requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
         if not isinstance(requested_hash_block_size, int):
@@ -266,28 +269,27 @@ class KVPoolScheduler:
             block_keys: list[str] = []
             chunk_hash = block_hash if isinstance(block_hash, str) else block_hash.hex()
             pp_ranks = [self.pp_rank] if include_layers else range(self.pp_size)
-            for pcp_rank in range(self.pcp_size):
-                for dcp_rank in range(self.dcp_size):
-                    for head_or_tp_rank in range(head_or_tp_ranks):
-                        for pp_rank in pp_ranks:
-                            pool_key = PoolKey(
-                                KeyMetadata(
-                                    self.model_name,
-                                    head_or_tp_rank,
-                                    pcp_rank,
-                                    dcp_rank,
-                                    pp_rank,
-                                    kv_cache_group_id=kv_cache_group_id,
-                                    cache_family=cache_family,
-                                ),
-                                chunk_hash,
+            for dcp_rank in range(self.dcp_size):
+                for head_or_tp_rank in range(head_or_tp_ranks):
+                    for pp_rank in pp_ranks:
+                        pool_key = PoolKey(
+                            KeyMetadata(
+                                self.model_name,
+                                head_or_tp_rank,
+                                0,  # All PCP replicas share the PCP=1 key namespace.
+                                dcp_rank,
+                                pp_rank,
+                                kv_cache_group_id=kv_cache_group_id,
+                                cache_family=cache_family,
+                            ),
+                            chunk_hash,
+                        )
+                        if include_layers:
+                            block_keys.extend(
+                                layer_key.to_string() for layer_key in pool_key.split_layers(self.num_layers)
                             )
-                            if include_layers:
-                                block_keys.extend(
-                                    layer_key.to_string() for layer_key in pool_key.split_layers(self.num_layers)
-                                )
-                            else:
-                                block_keys.append(pool_key.to_string())
+                        else:
+                            block_keys.append(pool_key.to_string())
             keys_by_block.append(block_keys)
         return keys_by_block
 
