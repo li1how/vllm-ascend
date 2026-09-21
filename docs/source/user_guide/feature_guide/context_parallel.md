@@ -64,7 +64,7 @@ vllm serve <supported-model> \
 
 Unlike DCP, PCP adds extra ranks: `world_size_with_pcp = prefill_context_parallel_size * original_world_size`.
 
-DSA-PCP embedding and LM Head weight sharding is opt-in. Set `enable_pcp_embedding_lmhead_weight_sharding` to store TP×PCP resident weight shards. This option is incompatible with fine-grained TP for these modules and with `enable_reduce_sample`.
+PCP weight sharding is opt-in. Set `enable_pcp_o_proj_weight_sharding` to shard both SFA-PCP O projection and DSA-PCP two-stage O projection (`wo_a`/`wo_b`). Set `enable_pcp_embedding_lmhead_weight_sharding` to shard DSA-PCP embedding and LM Head weights. Resident DSA weights use TP×PCP partitioning; O projection temporarily reconstructs one TP-local weight through a shared runtime buffer. Each option is incompatible with fine-grained TP for the same modules, and embedding/LM Head sharding is also incompatible with `enable_reduce_sample`.
 
 #### Speculative Decoding
 

@@ -78,7 +78,7 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
             get_pcp_group(),
         )
         linear_method = self._get_o_proj_weight_switch_method()
-        self.o_proj_weight_load_state = linear_method.prepare_layer_for_parallel_weight_load(
+        self.o_proj_weight_load_state = linear_method.prepare_layer_for_parallel_input_weight_load(
             self.o_proj,
             self.o_proj_weight_switch_config,
             self.o_proj_weight_load_partition,
