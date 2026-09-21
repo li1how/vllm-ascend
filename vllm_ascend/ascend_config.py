@@ -330,6 +330,7 @@ class AscendConfig:
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": false,
+            "enable_pcp_embedding_lmhead_weight_sharding": false,
             "draft_window_size": null,
             "mix_placement": false,
             "pa_shape_list": [],
@@ -466,6 +467,7 @@ class AscendConfig:
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = False
+    enable_pcp_embedding_lmhead_weight_sharding: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
@@ -665,6 +667,15 @@ class AscendConfig:
                 "DSA-CP is enabled, but the current config does not support sequence-parallel MoE. Disabling DSA-CP."
             )
         self.enable_dsa_cp = self.enable_dsa_cp and has_indexer and vc.parallel_config.use_sequence_parallel_moe
+
+        if self.enable_pcp_embedding_lmhead_weight_sharding:
+            from vllm_ascend.utils import model_uses_kpool_indexer, model_uses_sfa_sparse
+
+            if not has_indexer or model_uses_sfa_sparse(vc.model_config) or model_uses_kpool_indexer(vc.model_config):
+                raise ValueError(
+                    "enable_pcp_embedding_lmhead_weight_sharding is only supported "
+                    "by models using the Ascend DSA backend."
+                )
 
         # Sequence-parallel max_num_batched_tokens divisibility writeback
         if vc.parallel_config.prefill_context_parallel_size > 1 and enable_sp(vllm_config=vc):

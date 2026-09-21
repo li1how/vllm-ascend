@@ -64,6 +64,8 @@ vllm serve <supported-model> \
 
 Unlike DCP, PCP adds extra ranks: `world_size_with_pcp = prefill_context_parallel_size * original_world_size`.
 
+DSA-PCP embedding and LM Head weight sharding is opt-in. Set `enable_pcp_embedding_lmhead_weight_sharding` to store TP×PCP resident weight shards. This option is incompatible with fine-grained TP for these modules and with `enable_reduce_sample`.
+
 #### Speculative Decoding
 
 MRV2 PCP supports MTP with MLA and DSA models, Eagle3 with GQA models, and
