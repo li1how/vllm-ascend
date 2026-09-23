@@ -46,6 +46,7 @@ class AscendPCPAttentionContext:
     gathered_kv_write_mask: torch.Tensor | None = None
     # Device snapshot of allocated kernel-block counts in global request order.
     global_block_table_num_blocks: torch.Tensor | None = None
+    shard_decode_requests: bool = False
 
 
 class AscendPCPManager(PCPManager):
@@ -520,6 +521,7 @@ class AscendPCPManager(PCPManager):
                     :, self.pcp_rank
                 ],
                 hidden_restore_idx=torch.arange(restore_start, restore_start + num_tokens, device=self.device),
+                shard_decode_requests=getattr(self, "shard_decode_requests", False),
             )
 
         global_batch = self._global_batch
@@ -544,4 +546,5 @@ class AscendPCPManager(PCPManager):
             padded_gather_idx=self._padded_gather_idx,
             gathered_kv_write_mask=self._gathered_kv_write_mask,
             global_block_table_num_blocks=global_block_table_num_blocks,
+            shard_decode_requests=getattr(self, "shard_decode_requests", False),
         )

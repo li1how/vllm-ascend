@@ -80,7 +80,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve <deepseek-model-path> \
     --enable-expert-parallel --async-scheduling --enforce-eager
 ```
 
-The initial Ascend sharded-decode scope is eager, non-hybrid DeepSeek V2/V3/V3.2 MLA/SFA with RoPE; dense MLA requires unquantized KV. Graph execution, speculative decoding, KVPP and PCP O-proj weight sharding are rejected while decode sharding is active.
+The initial Ascend sharded-decode scope is eager, non-hybrid DeepSeek V2/V3/V3.2 MLA/SFA with RoPE and DeepSeek V4 DSA; dense MLA requires unquantized KV. DSA gathers owner hidden states to update the replicated SWA, compressor, and indexer caches before rank-local attention. Graph execution, speculative decoding, KVPP and PCP O-proj weight sharding are rejected while decode sharding is active.
 
 For performance comparisons, keep request lengths, output lengths, concurrency and warmup identical, with EP and asynchronous scheduling enabled in both runs. Sharded decode disables fused MLA preprocessing. To isolate the cost of request sharding from that preprocessing change, also use `--additional-config '{"enable_mlapo":false}'` in both runs.
 
