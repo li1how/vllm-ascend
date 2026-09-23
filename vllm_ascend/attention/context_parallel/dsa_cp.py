@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
 
@@ -13,7 +14,7 @@ from vllm.triton_utils import HAS_TRITON, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionImplBase, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import get_ascend_config, is_pcp_decode_sharding_enabled
 from vllm_ascend.attention import dsa_v1
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import (
@@ -2516,11 +2517,20 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
 
     supports_pcp: ClassVar[bool] = True
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # PCP prepares replicated caches before local attention, leaving no
-        # cache-update work for the auxiliary stream to overlap.
-        self.multistream_dsv4_dsa_overlap = False
+    def _use_multistream_attention(
+        self,
+        common_attn_metadata: dsa_v1.AscendDSAMetadata,
+        cache_is_prepared: bool,
+    ) -> bool:
+        # Replicated decode updates its local cache just like non-PCP DSA.
+        # Prefill and sharded decode prepare replicated caches first.
+        return (
+            self.multistream_dsv4_dsa_overlap
+            and not is_pcp_decode_sharding_enabled(self.vllm_config)
+            and not cache_is_prepared
+            and common_attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
+            and common_attn_metadata.num_prefills == 0
+        )
 
     def _gather_and_restore_hidden_states(
         self,
@@ -2607,6 +2617,117 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
             metadata=metadata,
         )
 
+    def _gather_global_cache_inputs(
+        self,
+        layer_name: str,
+        hidden_states: torch.Tensor,
+        attn_metadata: dsa_v1.DSAMetadataDict,
+    ) -> tuple[torch.Tensor, dsa_v1.AscendDSALayerMetadata]:
+        pcp_metadata = next(iter(attn_metadata.values()))
+        assert isinstance(pcp_metadata, AscendDSAPCPMetadata)
+        global_hidden_states = self._gather_and_restore_hidden_states(hidden_states, pcp_metadata)
+        global_dsa_metadata_by_prefix = {}
+        for cache_prefix, metadata in attn_metadata.items():
+            assert isinstance(metadata, AscendDSAPCPMetadata)
+            global_dsa_metadata_by_prefix[cache_prefix] = metadata.global_dsa_metadata
+        return global_hidden_states, self._get_layer_metadata(layer_name, global_dsa_metadata_by_prefix)
+
+    def _get_prepared_cache_overlap(
+        self,
+        layer_name: str,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: dsa_v1.DSAMetadataDict,
+        actual_tokens: int,
+    ) -> Callable[[], torch.Tensor] | None:
+        # Empty local ranks still participate in the global cache update.
+        if not self.multistream_dsv4_dsa_overlap or actual_tokens == 0:
+            return None
+        if not isinstance(next(iter(attn_metadata.values())), AscendDSAPCPMetadata):
+            return None
+
+        global_hidden_states, global_layer_metadata = self._gather_global_cache_inputs(
+            layer_name, hidden_states, attn_metadata
+        )
+        local_layer_metadata = self._get_layer_metadata(layer_name, attn_metadata)
+        local_common = local_layer_metadata.attention or local_layer_metadata.swa
+        local_req = dsa_v1._require_req_metadata(local_common)
+        global_swa_req = dsa_v1._require_req_metadata(global_layer_metadata.swa)
+        assert global_swa_req.slot_mapping is not None
+        cmp_kv, swa_kv, state_cache, _, _, _ = DeviceOperator.unpack_dsa_forward_kv_cache(kv_cache, self.compress_ratio)
+
+        def update_compressed_caches() -> None:
+            if self.compress_ratio <= 1:
+                return
+            compressor_metadata = global_layer_metadata.compressor
+            assert compressor_metadata is not None
+            assert cmp_kv is not None
+            assert state_cache is not None
+            self._update_global_compressor_cache(global_hidden_states, compressor_metadata, cmp_kv, state_cache)
+            if self.compress_ratio == 4:
+                indexer_metadata = global_layer_metadata.indexer
+                assert indexer_metadata is not None
+                indexer = self.indexer
+                assert indexer is not None
+                if not indexer.skip_topk:
+                    update = indexer.prepare_cache_update(global_hidden_states, kv_cache, indexer_metadata)
+                    cache_plan.indexer_cube_done = torch.npu.current_stream().record_event()
+                    indexer.scatter_prepared_cache_update(update)
+
+        cache_plan = dsa_v1.GlobalCacheOverlapPlan(
+            hidden_states=global_hidden_states,
+            cos=global_swa_req.cos[layer_name],
+            sin=global_swa_req.sin[layer_name],
+            slot_mapping=global_swa_req.slot_mapping,
+            after_qb_matmul=update_compressed_caches,
+        )
+
+        def run_attention() -> torch.Tensor:
+            local_hidden_states = hidden_states[:actual_tokens]
+            q, qr, qr_scale, _ = self._mla_prolog_multistream(
+                local_hidden_states,
+                local_req.cos[layer_name][:actual_tokens],
+                local_req.sin[layer_name][:actual_tokens],
+                swa_kv,
+                None,
+                is_prefill=local_common.num_prefills > 0,
+                global_cache_plan=cache_plan,
+            )
+            assert cache_plan.swa_ready is not None
+            assert cache_plan.caches_ready is not None
+            current_stream = torch.npu.current_stream()
+            topk = None
+            if self.compress_ratio == 4:
+                indexer = self.indexer
+                indexer_metadata = local_layer_metadata.indexer
+                assert indexer is not None
+                assert indexer_metadata is not None
+                if not indexer.skip_topk:
+                    assert cache_plan.indexer_cube_done is not None
+                    current_stream.wait_event(cache_plan.indexer_cube_done)
+                topk = indexer.select_topk_from_prepared_cache(
+                    layer_name,
+                    local_hidden_states,
+                    qr,
+                    kv_cache,
+                    indexer_metadata,
+                    cache_plan.caches_ready,
+                    qr_scale,
+                )
+            current_stream.wait_event(cache_plan.swa_ready)
+            current_stream.wait_event(cache_plan.caches_ready)
+            return self._forward_attention(
+                layer_name,
+                local_hidden_states,
+                kv_cache,
+                local_layer_metadata,
+                cache_is_prepared=True,
+                prepared_q=q,
+                prepared_topk=topk,
+            )
+
+        return run_attention
+
     def _prepare_caches_before_attention(
         self,
         layer_name: str,
@@ -2623,18 +2744,8 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
                 kv_cache,
                 attn_metadata,
             )
-        global_hidden_states = self._gather_and_restore_hidden_states(
-            hidden_states,
-            pcp_metadata,
-        )
-
-        global_dsa_metadata_by_prefix = {}
-        for cache_prefix, metadata in attn_metadata.items():
-            assert isinstance(metadata, AscendDSAPCPMetadata)
-            global_dsa_metadata_by_prefix[cache_prefix] = metadata.global_dsa_metadata
-        global_layer_metadata = self._get_layer_metadata(
-            layer_name,
-            global_dsa_metadata_by_prefix,
+        global_hidden_states, global_layer_metadata = self._gather_global_cache_inputs(
+            layer_name, hidden_states, attn_metadata
         )
 
         cmp_kv, swa_kv, state_cache, _, _, _ = DeviceOperator.unpack_dsa_forward_kv_cache(kv_cache, self.compress_ratio)
