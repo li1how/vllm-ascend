@@ -1275,7 +1275,13 @@ def test_inherited_sharded_partition_refreshes_empty_owner_cpu_metadata(pcp_rank
         draft_tokens=torch.empty((4, 0), dtype=torch.int64),
     )
     manager = AscendPCPManager(
-        4, pcp_rank, torch.device("cpu"), req_states=req_states, shard_decode_requests=True, max_num_reqs=4, max_num_tokens=8
+        4,
+        pcp_rank,
+        torch.device("cpu"),
+        req_states=req_states,
+        shard_decode_requests=True,
+        max_num_reqs=4,
+        max_num_tokens=8,
     )
     manager.vllm_config = _make_pcp_config(CUDAGraphMode.NONE)
     with (

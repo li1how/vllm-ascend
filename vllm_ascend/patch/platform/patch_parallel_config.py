@@ -33,6 +33,21 @@ def _use_sequence_parallel_moe(self: ParallelConfig) -> bool:
 ParallelConfig.use_sequence_parallel_moe = property(_use_sequence_parallel_moe)
 
 
+# The upstream PCP manager and MLA/Indexer layers all read this property.
+# Apply the Ascend-only switch here so they agree on the same batch layout.
+_upstream_pcp_shard_decode_requests = getattr(ParallelConfig, "pcp_shard_decode_requests", None)
+if isinstance(_upstream_pcp_shard_decode_requests, property):
+    _upstream_pcp_shard_decode_requests_getter = _upstream_pcp_shard_decode_requests.fget
+    assert _upstream_pcp_shard_decode_requests_getter is not None
+
+    def _pcp_shard_decode_requests(self: ParallelConfig) -> bool:
+        return _upstream_pcp_shard_decode_requests_getter(self) and getattr(
+            self, "_ascend_enable_pcp_decode_sharding", True
+        )
+
+    ParallelConfig.pcp_shard_decode_requests = property(_pcp_shard_decode_requests)
+
+
 # v0.29.0 (98dff2a81d747d1dba01a47f939f48c3526d4206) validator,
 # with only the platform-independent PCP+DP rejection removed for Ascend.
 # Upstream #54523 (7c2f1ff4958eaf0818405e9192c71608fe4a16b1)

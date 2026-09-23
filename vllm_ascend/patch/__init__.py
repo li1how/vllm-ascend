@@ -1571,3 +1571,17 @@
 #       Remove this patch when upstream provides a backend capability hook for
 #       enabling MoE sequence parallelism with DP=1.
 #
+#   3. `vllm.config.parallel.ParallelConfig.pcp_shard_decode_requests`
+#    Why:
+#       Upstream enables PCP decode request sharding from topology alone.
+#       Ascend needs a switch to compare sharded and replicated decode at the
+#       same topology. The PCP manager and model layers must see one decision.
+#    How:
+#       Preserve the upstream topology predicate and additionally read the
+#       per-config Ascend enable_pcp_decode_sharding override. On vLLM versions
+#       without the upstream property, leave the class unchanged.
+#    Related PR (if no, explain why):
+#       No, this is an Ascend-specific comparison switch.
+#    Future Plan:
+#       Remove when upstream exposes a per-config PCP decode sharding switch.
+#

@@ -51,7 +51,7 @@ def is_mega_moe_supported() -> bool:
 
 def is_pcp_decode_sharding_enabled(vllm_config: VllmConfig) -> bool:
     """Use the upstream PCP policy before the MRv2 manager is constructed."""
-    return vllm_config.use_v2_model_runner and vllm_config.parallel_config.pcp_shard_decode_requests
+    return vllm_config.use_v2_model_runner and getattr(vllm_config.parallel_config, "pcp_shard_decode_requests", False)
 
 
 def validate_additional_config_bool(value: Any, path: str) -> bool:
@@ -341,6 +341,7 @@ class AscendConfig:
             "enable_mc2_hierarchy_comm": false,
             "enable_reduce_sample": false,
             "enable_dsa_cp": false,
+            "enable_pcp_decode_sharding": true,
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": false,
@@ -478,6 +479,7 @@ class AscendConfig:
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_reduce_sample: bool = False
     enable_dsa_cp: bool = False
+    enable_pcp_decode_sharding: bool = True
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = False
@@ -572,7 +574,7 @@ class AscendConfig:
 
     def _validate_pcp_decode_sharding(self, vllm_config: VllmConfig) -> None:
         """Reject layouts whose cache or collective contract is not supported."""
-        if not is_pcp_decode_sharding_enabled(vllm_config):
+        if not getattr(self, "enable_pcp_decode_sharding", True) or not is_pcp_decode_sharding_enabled(vllm_config):
             return
         # Config modules are also imported during platform discovery, before
         # vllm.config has finished loading. Import the enum only at validation.
@@ -1641,6 +1643,12 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
 
 def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+    # Keep the upstream PCP manager and model-layer decisions consistent. The
+    # platform patch reads this override from this ParallelConfig instance.
+    vllm_config.parallel_config._ascend_enable_pcp_decode_sharding = validate_additional_config_bool(
+        additional_config.get("enable_pcp_decode_sharding", True),
+        "additional_config.enable_pcp_decode_sharding",
+    )
     # Upstream EngineArgs injects --gdn-prefill-backend / --kda-prefill-backend
     # into additional_config. The generic GDN/KDA model layers consume them
     # (qwen_gdn_linear_attn / kimi_gdn_linear_attn), but on non-CUDA platforms

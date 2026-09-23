@@ -68,7 +68,7 @@ When PCP size is greater than 1, PCP stores embedding and LM Head weights as TPÃ
 
 #### Decode Request Sharding
 
-With the paired upstream PCP decode-sharding implementation, MRV2 assigns each decode request to one PCP rank when PCP > 1 and DCP = 1; the KV cache remains replicated. In the paired vLLM revision, the internal `pcp_shard_decode_requests` property enables this behavior from the topology. It has no `--enable-pcp-decode-sharding` or `EngineArgs` switch to turn it off at the same topology.
+With the paired upstream PCP decode-sharding implementation, MRV2 assigns each decode request to one PCP rank when PCP > 1 and DCP = 1; the KV cache remains replicated. Ascend enables this behavior by default. Set `--additional-config '{"enable_pcp_decode_sharding":false}'` to keep decode requests replicated at the same topology. This switch also applies to the upstream PCP manager and model layers, so both use the same batch layout.
 
 For example:
 
