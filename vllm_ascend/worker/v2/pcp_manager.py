@@ -56,6 +56,8 @@ class AscendPCPManager(PCPManager):
     _global_batch_slot_mappings: torch.Tensor | None
     _gathered_kv_slot_mappings: torch.Tensor | None
     _pad_slot_id: torch.Tensor
+    global_input_buffers: AscendInputBuffers | None = None
+    _capture_global_batch: AscendInputBatch | None = None
 
     def __init__(
         self,
@@ -240,22 +242,6 @@ class AscendPCPManager(PCPManager):
             num_draft_tokens_per_req=local_draft_counts,
         )
 
-    def get_num_tokens_for_dispatch(
-        self,
-        num_scheduled_tokens: np.ndarray,
-        is_prefilling: np.ndarray,
-    ) -> int:
-        if (
-            self.shard_decode_requests
-            and self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
-            and not bool(is_prefilling.any())
-        ):
-            # The FULL graph runs one row per global decode request on every
-            # PCP rank. DP metadata must describe that graph-sized model input,
-            # not the compact owner-local row count used by eager dispatch.
-            return int(num_scheduled_tokens.sum())
-        return super().get_num_tokens_for_dispatch(num_scheduled_tokens, is_prefilling)
-
     def _full_decode_requests_are_token_sized(self, global_batch: AscendInputBatch) -> bool:
         """Whether a FULL_DECODE_ONLY graph replays exactly one token per padded request.
 
@@ -304,14 +290,16 @@ class AscendPCPManager(PCPManager):
 
         # PCP builds the local layout from actual tokens, but a FULL decode
         # graph replays a fixed padded layout on every rank.
-        graph_num_tokens = global_batch.num_tokens_after_padding
         is_decode_only = not bool(global_batch.is_prefilling_np.any())
         # FULL_DECODE_ONLY graphs capture one token for every padded request.
         # Other graph modes may pad tokens without padding request metadata.
         is_full_decode_graph = self._full_decode_requests_are_token_sized(global_batch)
-        graph_num_reqs = (
-            global_batch.num_tokens_after_padding if is_full_decode_graph else global_batch.num_reqs_after_padding
+        graph_num_tokens = (
+            padded_num_tokens or local_batch.num_tokens_after_padding
+            if self.shard_decode_requests and is_full_decode_graph
+            else global_batch.num_tokens_after_padding
         )
+        graph_num_reqs = graph_num_tokens if is_full_decode_graph else global_batch.num_reqs_after_padding
         # On newer vLLM, the base PCP manager may already honor
         # ``padded_num_tokens`` while leaving request-shaped metadata at the
         # actual request count. Pad when either extent is still short so the
@@ -528,7 +516,11 @@ class AscendPCPManager(PCPManager):
             self._global_batch_slot_mappings[
                 :, self._global_batch.num_tokens : self._global_batch.num_tokens_after_padding
             ].fill_(-1)
-        graph_num_tokens = self._global_batch.num_tokens_after_padding
+        graph_num_tokens = (
+            self._local_batch.num_tokens_after_padding
+            if self.shard_decode_requests and self._local_batch is not None
+            else self._global_batch.num_tokens_after_padding
+        )
         is_decode_only = not bool(self._global_batch.is_prefilling_np.any())
         graph_sharded_decode = self.shard_decode_requests and self._full_decode_requests_are_token_sized(
             self._global_batch
@@ -575,6 +567,30 @@ class AscendPCPManager(PCPManager):
             assert block_tables is not None
             assert slot_mappings is not None
             num_tokens = input_batch.num_tokens_after_padding
+            if self.shard_decode_requests:
+                # A FULL graph captures global DSA cache metadata for
+                # min(local_bucket * PCP, max_num_reqs) rows. Idle DP dummy
+                # steps must refresh that entire buffer too: refreshing only
+                # their one local row leaves stale restore indices from a
+                # larger preceding graph, which may exceed this graph's gather.
+                global_batch = self._capture_global_batch
+                if global_batch is None:
+                    global_buffers = self.global_input_buffers
+                    assert global_buffers is not None
+                    global_num_tokens = min(global_buffers.max_num_reqs, num_tokens * self.pcp_world_size)
+                    global_batch = AscendInputBatch.make_dummy(  # type: ignore[call-arg]
+                        global_num_tokens, global_num_tokens, global_buffers
+                    )
+                assert self._block_tables is not None
+                assert self._global_batch_slot_mappings is not None
+                global_num_tokens = global_batch.num_tokens_after_padding
+                return AscendPCPAttentionContext(
+                    global_batch=global_batch,
+                    global_block_tables=self._block_tables.get_dummy_block_tables(global_num_tokens),
+                    global_slot_mappings=self._global_batch_slot_mappings[:, :global_num_tokens],
+                    hidden_restore_idx=torch.arange(global_num_tokens, device=self.device),
+                    shard_decode_requests=True,
+                )
             restore_start = self.pcp_rank * num_tokens
             return AscendPCPAttentionContext(
                 global_batch=input_batch,

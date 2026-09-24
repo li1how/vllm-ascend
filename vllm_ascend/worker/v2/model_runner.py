@@ -273,6 +273,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.vllm_config = self.vllm_config
+                self.pcp_manager.global_input_buffers = self.input_buffers
                 self.model_state.pcp_manager = self.pcp_manager
                 if self.speculator is not None:
                     self.speculator.pcp_manager = self.pcp_manager
@@ -407,6 +408,21 @@ class NPUModelRunner(GPUModelRunner):
         self._check_oproj_tp_graph_step(batch_desc.cg_mode)
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
+        sharded_decode_graph = (
+            self.pcp_manager is not None
+            and self.pcp_manager.shard_decode_requests
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and not batch_req_state.has_prefill
+            and self.decode_query_len == 1
+        )
+        if sharded_decode_graph:
+            # The model graph consumes one owner-local bucket per PCP rank.
+            # Global DSA cache metadata still needs a fixed request extent for
+            # that bucket, independent of the current number of requests.
+            num_tokens_after_padding = min(
+                self.max_num_reqs,
+                batch_desc.num_tokens * self.pcp_manager.pcp_world_size,
+            )
         assert num_tokens > 0
 
         req_ids = batch_req_state.req_ids
@@ -473,7 +489,7 @@ class NPUModelRunner(GPUModelRunner):
         # Get query_start_loc.
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        num_reqs_padded = num_tokens_after_padding if sharded_decode_graph else (batch_desc.num_reqs or num_reqs)
         query_start_loc_np = np.empty(self.max_num_reqs + 2, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
@@ -489,7 +505,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs,
                 query_start_loc_np,
                 batch_desc.cg_mode,
-                batch_desc.num_reqs,
+                num_reqs_padded if sharded_decode_graph else batch_desc.num_reqs,
             )
 
         query_start_loc = self.input_buffers.query_start_loc
@@ -551,8 +567,9 @@ class NPUModelRunner(GPUModelRunner):
         if adaptive_verification_active and self.use_fia:
             self.input_buffers.seq_lens_np[:num_reqs] = seq_lens[:num_reqs].cpu().numpy()
 
-        # Pad for full CUDA graph mode.
-        self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
+        # A sharded graph pads global request metadata beyond the real batch.
+        # Clear those CPU lengths as well as the unused tail before DSA reads it.
+        self.input_buffers.seq_lens_np[num_reqs if sharded_decode_graph else num_reqs_padded :] = 0
 
         dcp_local_seq_lens = None
         # Main computes DCP lengths in the inherited execute_model after PCP

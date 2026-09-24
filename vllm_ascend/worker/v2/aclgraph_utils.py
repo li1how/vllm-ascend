@@ -71,9 +71,9 @@ def _prepare_pcp_inputs_to_capture(
     # supplies capture-only PCP metadata instead. The block tables must
     # retain the same PCP-local backing that runtime prepare_attn updates,
     # because the SFA full graph cannot rebind their captured pointer.
-    # The Ascend dummy carries the seq_lens_np/attn_state views consumed
-    # by Ascend metadata builders and doubles as the capture-time PCP
-    # global batch (is_dummy=True).
+    # The local dummy uses PCP-owned buffers. Sharded decode also needs a
+    # separate global dummy backed by the runner's persistent buffers so DSA
+    # captures the same global cache-update metadata it sees during replay.
     input_batch = AscendInputBatch.make_dummy(  # type: ignore[call-arg]
         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
     )
@@ -81,15 +81,25 @@ def _prepare_pcp_inputs_to_capture(
     slot_mappings = pcp_manager.get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = cudagraph_utils.build_slot_mappings_by_layer(slot_mappings, kv_cache_config)
 
-    attn_metadata = model_state.prepare_attn(
-        input_batch,
-        CUDAGraphMode.NONE,
-        input_block_tables,
-        slot_mappings,
-        attn_groups,
-        kv_cache_config,
-        for_capture=full_cudagraph,
-    )
+    if pcp_manager.shard_decode_requests and full_cudagraph:
+        global_buffers = pcp_manager.global_input_buffers
+        assert global_buffers is not None
+        global_num_reqs = min(global_buffers.max_num_reqs, num_tokens * pcp_manager.pcp_world_size)
+        pcp_manager._capture_global_batch = AscendInputBatch.make_dummy(  # type: ignore[call-arg]
+            global_num_reqs, global_num_reqs, global_buffers, max_query_len=max_query_len
+        )
+    try:
+        attn_metadata = model_state.prepare_attn(
+            input_batch,
+            CUDAGraphMode.NONE,
+            input_block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture=full_cudagraph,
+        )
+    finally:
+        pcp_manager._capture_global_batch = None
     return cudagraph_utils.AttentionState(attn_metadata, slot_mappings_by_layer)
 
 
