@@ -72,6 +72,15 @@ class AscendModelState(DefaultModelState):
 
         num_actual_reqs = input_batch.num_reqs
         num_actual_tokens = input_batch.num_tokens
+        if (
+            cudagraph_mode == CUDAGraphMode.FULL
+            and self.pcp_manager is not None
+            and self.pcp_manager.shard_decode_requests
+            and num_actual_tokens == 0
+        ):
+            # Upstream represents an empty sharded rank with a zero-token
+            # placeholder request. It is not an actual graph request.
+            num_actual_reqs = 0
         if self.kvpp_runtime is not None and self.kvpp_runtime.scheduler is not None:
             # PCP-local offsets include earlier chunks of this same forward.
             # Use prior-forward history shared by every PCP x TP group member.

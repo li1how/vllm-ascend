@@ -580,8 +580,11 @@ class AscendConfig:
         # vllm.config has finished loading. Import the enum only at validation.
         from vllm.config import CUDAGraphMode
 
-        if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            raise ValueError("Ascend PCP decode sharding currently requires eager execution (--enforce-eager).")
+        if vllm_config.compilation_config.cudagraph_mode not in {
+            CUDAGraphMode.NONE,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+        }:
+            raise ValueError("Ascend PCP decode sharding supports eager or FULL_DECODE_ONLY graphs only.")
         if vllm_config.speculative_config is not None:
             raise ValueError("Ascend PCP decode sharding does not support speculative decoding yet.")
         model_config = vllm_config.model_config

@@ -2409,7 +2409,12 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         num_actual_reqs: int | None,
         common_ratio_to_sas_metadata: dict[Any, Any],
     ) -> dsa_v1.AscendDSAMetadata:
-        if local_common_attn_metadata.num_actual_tokens > 0:
+        graph_decode = (
+            self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and local_common_attn_metadata.num_input_tokens > 0
+            and not bool(local_common_attn_metadata.is_prefilling.any())
+        )
+        if local_common_attn_metadata.num_actual_tokens > 0 or graph_decode:
             return super().build(
                 common_prefix_len,
                 local_common_attn_metadata,
@@ -2449,7 +2454,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         has_prefill = bool(pcp_context.global_batch.is_prefilling_np.any())
         needs_global_cache_update = has_prefill or pcp_context.shard_decode_requests
         if needs_global_cache_update:
-            if has_prefill:
+            if has_prefill or pcp_context.shard_decode_requests:
                 pcp_context = self._prepare_graph_pcp_context(pcp_context)
             elif pcp_context.global_batch.is_dummy:
                 # Dummy decode has no real cache writes on any PCP rank.
