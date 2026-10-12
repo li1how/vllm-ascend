@@ -26,7 +26,8 @@ def test_compressor_from_projected_matches_hidden_chunks(ratio, width, coff):
     weight_score = (torch.randn(coff * width, 4096, device="npu") * 0.02).bfloat16()
     ape = torch.randn(ratio, coff * width, device="npu") * 0.02
     norm = 0.5 + torch.rand(width, device="npu")
-    state_block_size = 8 if ratio == 4 else 16
+    # A3 cache block size 128 uses C4 state blocks of 8 and C128 blocks of 32.
+    state_block_size = 8 if ratio == 4 else 32
     pages_per_request = 1024 // state_block_size
     state_a = torch.zeros((1 + 4 * pages_per_request, state_block_size, 2 * coff * width), device="npu")
     state_b = state_a.clone()
