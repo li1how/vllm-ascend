@@ -374,6 +374,7 @@ class DeepseekV4Indexer(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor, ...],
         metadata: AscendIndexerMetadata,
+        projected: torch.Tensor | None = None,
     ) -> None:
         """Update Indexer caches without projecting queries or selecting TopK."""
         if hidden_states.shape[0] == 0:
@@ -383,11 +384,14 @@ class DeepseekV4Indexer(nn.Module):
         _, hadamard = self._get_indexer_cache_metadata(metadata)
         compressor = self.compressor
         assert compressor is not None
-        key, slot_mapping = compressor(
-            hidden_states=hidden_states,
-            state_cache=state_cache,
-            metadata=metadata.compressor,
-        )
+        if projected is None:
+            key, slot_mapping = compressor(
+                hidden_states=hidden_states,
+                state_cache=state_cache,
+                metadata=metadata.compressor,
+            )
+        else:
+            key, slot_mapping = compressor.forward_projected(projected, state_cache, metadata.compressor)
         if key.shape[0] == 0:
             return
         if compressor.rotate:

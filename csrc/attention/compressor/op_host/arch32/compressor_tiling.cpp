@@ -49,7 +49,9 @@ void CompressorTiling::ConvertRequiredParams(gert::TilingContext &context, Compr
     compressorContext.cmpKv.desc = context.GetOutputDesc(CMP_KV_OUTPUT_INDEX);
     compressorContext.cmpKv.shape = context.GetOutputShape(CMP_KV_OUTPUT_INDEX);
 
-    compressorContext.dtype = compressorContext.x.desc->GetDataType();
+    compressorContext.dtype = compressorContext.x.desc->GetDataType() == ge::DT_FLOAT
+                                  ? compressorContext.wkv.desc->GetDataType()
+                                  : compressorContext.x.desc->GetDataType();
     auto xDimNum = compressorContext.x.shape->GetStorageShape().GetDimNum();
     if (xDimNum == COMPRESSOR_DIM_NUM_3) {
         compressorContext.layout = LayoutType::LAYOUT_BSH;
@@ -129,6 +131,7 @@ ge::graphStatus CompressorTiling::GetNpuInfo()
 
 ge::graphStatus CompressorTiling::SetBaseInfo()
 {
+    baseParams_->projectedInput = context_->x.desc->GetDataType() == ge::DT_FLOAT;
     if (context_->x.shape->GetStorageShape().GetDimNum() == COMPRESSOR_DIM_NUM_3) {
         baseParams_->batchSize = context_->x.shape->GetStorageShape().GetDim(COMPRESSOR_DIM_INDEX_0);
         baseParams_->seqSize = context_->x.shape->GetStorageShape().GetDim(COMPRESSOR_DIM_INDEX_1);
@@ -142,6 +145,17 @@ ge::graphStatus CompressorTiling::SetBaseInfo()
         baseParams_->cgSize = context_->ropeSin.shape->GetStorageShape().GetDim(COMPRESSOR_DIM_INDEX_0);
     }
 
+    if (baseParams_->projectedInput) {
+        OP_CHECK_IF(context_->layout != LayoutType::LAYOUT_TH || context_->dtype != ge::DT_BF16,
+                    OP_LOGE(context_->opName, "Projected input requires TH layout and BF16 weights"),
+                    return ge::GRAPH_FAILED);
+        const auto width = context_->x.shape->GetStorageShape().GetDim(COMPRESSOR_DIM_INDEX_1);
+        const auto expectedWidth = 2 * (*context_->coff) * context_->normWeight.shape->GetStorageShape().GetDim(0);
+        OP_CHECK_IF(width != expectedWidth,
+                    OP_LOGE(context_->opName, "Projected input width must equal 2*coff*headDim"),
+                    return ge::GRAPH_FAILED);
+        baseParams_->hiddenSize = context_->wkv.shape->GetStorageShape().GetDim(COMPRESSOR_DIM_INDEX_1);
+    }
     baseParams_->headDim = context_->normWeight.shape->GetStorageShape().GetDim(COMPRESSOR_DIM_INDEX_0);
     baseParams_->cmpRatio = static_cast<uint32_t>(*context_->cmpRatio);
     baseParams_->csSize = baseParams_->seqSize - (baseParams_->seqSize % baseParams_->cmpRatio);
@@ -365,7 +379,7 @@ ge::graphStatus CompressorTiling::GenTilingKey() const
     uint8_t templateId = static_cast<uint8_t>(context_->templateId);
     uint8_t cacheMode = static_cast<uint8_t>(*context_->cacheMode);
 
-    auto xDtype = context_->x.desc->GetDataType();
+    auto xDtype = context_->dtype;
     if (xDtype == ge::DT_BF16) {
         dtype = 0;
     } else if (xDtype == ge::DT_FLOAT16) {

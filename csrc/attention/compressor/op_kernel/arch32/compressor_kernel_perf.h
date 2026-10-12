@@ -133,6 +133,8 @@ private:
     const optiling::CompressorTilingData* __restrict tilingData_;
     // ===========================Workspace Global Tensor===========================
     GlobalTensor<MM1_OUT_T> mm1KvResGm;
+    GlobalTensor<T> projectedGm_;
+    bool projectedInput_ = false;
     GlobalTensor<MM1_OUT_T> mm1ScoreResGm;
     GlobalTensor<MM1_OUT_T> vec1KvCacheGm;
     GlobalTensor<MM1_OUT_T> vec1ScoreCacheGm;
@@ -182,6 +184,10 @@ __aicore__ inline void CompressorKernelPerf<COMP>::Init(
         constInfo.aiCoreIdx = GetBlockIdx();
     }
     InitTilingData();
+    projectedInput_ = tilingData_->baseParams.projectedInput != 0;
+    if (projectedInput_) {
+        projectedGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(x));
+    }
     // init tools
     tools_.toolParams_.seqSize = tilingData_->baseParams.seqSize;
     tools_.toolParams_.cmpRatio = tilingData_->baseParams.cmpRatio;
@@ -526,7 +532,7 @@ __aicore__ inline void CompressorKernelPerf<COMP>::InitWorkspace(__gm__ uint8_t 
 template <typename COMP>
 __aicore__ inline void CompressorKernelPerf<COMP>::ComputeMm1(const RunInfo &info, bool isNeedExcute) {
     CrossCoreWaitFlag<SYNC_MODE2, PIPE_FIX>(SYNC_V1_C1_FLAG + info.cubeDbIdx);
-    if (isNeedExcute) {
+    if (isNeedExcute && !projectedInput_) {
         blockCube_.ComputeMm1(info);
     }
     CrossCoreSetFlag<SYNC_MODE0, PIPE_FIX>(SYNC_C1_FLAG);
@@ -675,6 +681,12 @@ __aicore__ inline void CompressorKernelPerf<COMP>::Process()
         if ASCEND_IS_AIC {
             ComputeMm1(extraInfo0, isNeedExcuteC1);
         } else {
+            if (projectedInput_) {
+                blockVec_.CopyProjectedToWorkspace(projectedGm_, extraInfo0);
+                // Both Vector subblocks and every head tile must finish their
+                // workspace copies before the existing window readers run.
+                SyncAll();
+            }
             ComputeVec1(vec1Info);
             UpdateVec2Info(vec2Info, i, vec1Info);
 

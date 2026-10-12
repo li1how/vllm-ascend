@@ -2573,6 +2573,9 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
         # PCP prepares replicated caches before local attention, leaving no
         # cache-update work for the auxiliary stream to overlap.
         self.multistream_dsv4_dsa_overlap = False
+        self.pcp_cache_projection_mode = get_ascend_config().pcp_cache_projection_mode
+        if self.pcp_cache_projection_mode != "hidden" and is_950():
+            raise ValueError("PCP cache projection currently supports the A3 Compressor only")
         self.enable_pcp_o_proj_weight_sharding = enable_pcp_o_proj_weight_sharding()
         self._pcp_o_proj_weight_switches = None
         self._pcp_o_proj_use_full_weight = False
@@ -2749,12 +2752,13 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
         global_hidden_states: torch.Tensor,
         swa_kv_cache: torch.Tensor,
         swa_metadata: dsa_v1.AscendDSAMetadata,
+        projected_kv: torch.Tensor | None = None,
     ) -> None:
         """Update the replicated SWA cache from the canonical global batch."""
         req_metadata = dsa_v1._require_req_metadata(swa_metadata)
         assert req_metadata.slot_mapping is not None
 
-        kv = self.kv_norm(self.wkv(global_hidden_states))
+        kv = self.kv_norm(self.wkv(global_hidden_states) if projected_kv is None else projected_kv)
         assert self.rope_head_dim is not None
         kv = kv.view(
             -1,
@@ -2783,14 +2787,18 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
         metadata: AscendCompressorMetadata,
         compress_kv_cache: torch.Tensor,
         state_cache: torch.Tensor,
+        projected: torch.Tensor | None = None,
     ) -> None:
         """Update the DSA compressor cache from the canonical global batch."""
         assert self.compressor is not None
-        compressed_kv, compress_slot_mapping = self.compressor(
-            hidden_states=global_hidden_states,
-            state_cache=state_cache,
-            metadata=metadata,
-        )
+        if projected is None:
+            compressed_kv, compress_slot_mapping = self.compressor(
+                hidden_states=global_hidden_states,
+                state_cache=state_cache,
+                metadata=metadata,
+            )
+        else:
+            compressed_kv, compress_slot_mapping = self.compressor.forward_projected(projected, state_cache, metadata)
         if compressed_kv.shape[0] > 0:
             get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(
                 compress_kv_cache,
@@ -2803,6 +2811,7 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
         global_hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor, ...],
         metadata: AscendIndexerMetadata,
+        projected: torch.Tensor | None = None,
     ) -> None:
         """Update the Indexer cache from the canonical global batch."""
         indexer = self.indexer
@@ -2813,6 +2822,7 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
             hidden_states=global_hidden_states,
             kv_cache=kv_cache,
             metadata=metadata,
+            projected=projected,
         )
 
     def _prepare_caches_before_attention(
@@ -2831,10 +2841,33 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
                 kv_cache,
                 attn_metadata,
             )
-        global_hidden_states = self._gather_and_restore_hidden_states(
-            hidden_states,
-            pcp_metadata,
+        use_projected = get_pcp_group().world_size > 1 and (
+            self.pcp_cache_projection_mode == "projected"
+            or (self.pcp_cache_projection_mode == "c128_only" and self.compress_ratio != 4)
         )
+        projected_swa = projected_compressor = projected_indexer = None
+        if use_projected:
+            projected_swa = self._gather_and_restore_hidden_states(self.wkv(hidden_states), pcp_metadata)
+            projections = []
+            widths = []
+            if self.compress_ratio > 1:
+                assert self.compressor is not None
+                projections.append(self.compressor.project(hidden_states))
+                widths.append(projections[-1].shape[-1])
+                if self.compress_ratio == 4 and self.indexer is not None and not self.indexer.skip_topk:
+                    assert self.indexer.compressor is not None
+                    projections.append(self.indexer.compressor.project(hidden_states))
+                    widths.append(projections[-1].shape[-1])
+                packed = torch.cat(projections, dim=-1) if len(projections) > 1 else projections[0]
+                restored = self._gather_and_restore_hidden_states(packed, pcp_metadata)
+                projected_compressor = restored[:, : widths[0]].contiguous()
+                if len(widths) > 1:
+                    projected_indexer = restored[:, widths[0] :].contiguous()
+            # Cache update helpers use this tensor only for their row count when
+            # supplied projections; full hidden states are never communicated.
+            global_hidden_states = projected_swa
+        else:
+            global_hidden_states = self._gather_and_restore_hidden_states(hidden_states, pcp_metadata)
 
         global_dsa_metadata_by_prefix = {}
         for cache_prefix, metadata in attn_metadata.items():
@@ -2852,6 +2885,7 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
             global_hidden_states,
             swa_kv,
             global_layer_metadata.swa,
+            projected_kv=projected_swa,
         )
         if self.compress_ratio > 1:
             compressor_metadata = global_layer_metadata.compressor
@@ -2863,6 +2897,7 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
                 compressor_metadata,
                 cmp_kv,
                 state_cache,
+                projected=projected_compressor,
             )
 
             if self.compress_ratio == 4:
@@ -2872,6 +2907,7 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
                     global_hidden_states,
                     kv_cache,
                     indexer_metadata,
+                    projected=projected_indexer,
                 )
         # Every rank must join the weight gathers, including ranks that return
         # before local attention. Launch after the cache collectives to overlap

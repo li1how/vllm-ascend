@@ -66,6 +66,7 @@ public:
     __aicore__ inline void FreeEventID();
     // =================================执行计算=================================
     __aicore__ inline void ComputeVec1(const Vec1RunInfo &info);
+    __aicore__ inline void CopyProjectedToWorkspace(const GlobalTensor<T> &projected, const RunInfo &info);
     __aicore__ inline uint32_t GetBasicNum();
     __aicore__ inline uint32_t GetScSize();
     __aicore__ inline void GetScIdxInfo(uint32_t bStart, uint32_t scStart, uint32_t dealScSize, uint32_t v2TcStart,
@@ -346,6 +347,45 @@ __aicore__ inline uint32_t CompressorBlockVectorPerf<COMP>::GetSeqUsed(uint32_t 
             return constInfo_.sSize;
         }
     }
+}
+
+template <typename COMP>
+__aicore__ inline void CompressorBlockVectorPerf<COMP>::CopyProjectedToWorkspace(
+    const GlobalTensor<T> &projected, const RunInfo &info)
+{
+    // Use the same per-group, double-buffered layout as the original Cube
+    // output, so all Vector window/state handling remains unchanged.
+    if (info.bStart >= constInfo_.batchSize || info.dealSeqCnt == 0) {
+        return;
+    }
+    uint32_t rowsPerSubBlock = (info.dealSeqCnt + 1) / 2;
+    uint32_t firstRow = GetSubBlockIdx() * rowsPerSubBlock;
+    if (firstRow >= info.dealSeqCnt) {
+        return;
+    }
+    uint32_t rows = min(rowsPerSubBlock, info.dealSeqCnt - firstRow);
+    uint32_t width = static_cast<uint32_t>(COMP::coff) * constInfo_.headDim;
+    uint64_t token = tools_.GetTIdxByBatch(info.bStart) + info.sStart + firstRow;
+    uint64_t outputBase = info.cubeDbIdx * constInfo_.dbSize +
+                          constInfo_.curGroupIdx * constInfo_.mm1KvResSize + firstRow * width + constInfo_.dIdx;
+    LocalTensor<T> buffer = inputQue1.AllocTensor<T>();
+    for (uint32_t score = 0; score < 2; ++score) {
+        for (uint32_t part = 0; part < static_cast<uint32_t>(COMP::coff); ++part) {
+            uint64_t inputOffset = token * 2 * width + score * width + part * constInfo_.headDim + constInfo_.dIdx;
+            DataCopyAlignGmToUb(buffer, projected[inputOffset], rows, constInfo_.dBaseSize,
+                               2 * width, constInfo_.dBaseSize);
+            event_t readEvent = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_MTE3));
+            SetFlag<HardEvent::MTE2_MTE3>(readEvent);
+            WaitFlag<HardEvent::MTE2_MTE3>(readEvent);
+            GlobalTensor<T> target = score == 0 ? kvMm1ResGm_ : scoreMm1ResGm_;
+            DataCopyAlignUbToGm(target[outputBase + part * constInfo_.headDim], buffer,
+                               rows, constInfo_.dBaseSize, constInfo_.dBaseSize, width);
+            event_t writeEvent = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+            SetFlag<HardEvent::MTE3_MTE2>(writeEvent);
+            WaitFlag<HardEvent::MTE3_MTE2>(writeEvent);
+        }
+    }
+    inputQue1.FreeTensor(buffer);
 }
 
 template <typename COMP>

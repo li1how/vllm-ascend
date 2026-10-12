@@ -941,7 +941,8 @@ std::vector<bool> is_contiguous_axes(const at::Tensor &tensor)
 }
 
 std::tuple<at::Tensor> construct_compressor_output_tensor(const at::Tensor &x, const at::Tensor &norm_weight,
-                                                          const at::Tensor &rope_sin, int64_t cmp_ratio, int64_t coff)
+                                                          const at::Tensor &rope_sin, int64_t cmp_ratio, int64_t coff,
+                                                          at::ScalarType output_dtype)
 {
     constexpr int DIM_3 = 3;
     auto x_dim = x.dim();
@@ -956,7 +957,7 @@ std::tuple<at::Tensor> construct_compressor_output_tensor(const at::Tensor &x, c
         cmp_kv_size = {cmp_s, norm_weight.size(0)};
     }
 
-    cmp_kv = at::empty(cmp_kv_size, x.options().dtype(x.dtype()));
+    cmp_kv = at::empty(cmp_kv_size, x.options().dtype(output_dtype));
 
     return std::tuple<at::Tensor>(cmp_kv);
 }
@@ -989,7 +990,14 @@ std::tuple<at::Tensor> compressor(const at::Tensor &x, const at::Tensor &wkv, co
 
     TORCH_CHECK(cmp_ratio > VALUE_0, "cmp_ratio should be greater than 0");
 
-    std::tuple<at::Tensor> output = construct_compressor_output_tensor(x, norm_weight, rope_sin, cmp_ratio, coff);
+    if (x.scalar_type() == at::kFloat) {
+        TORCH_CHECK(x_dim == DIM_2 && wkv.scalar_type() == at::kBFloat16 && wgate.scalar_type() == at::kBFloat16,
+                    "Projected Compressor requires 2D FP32 projections and BF16 weights");
+        TORCH_CHECK(x.size(1) == 2 * coff * norm_weight.size(0), "Invalid projected Compressor width");
+    }
+    auto output_dtype = x.scalar_type() == at::kFloat ? at::kBFloat16 : x.scalar_type();
+    std::tuple<at::Tensor> output = construct_compressor_output_tensor(x, norm_weight, rope_sin, cmp_ratio, coff,
+                                                                     output_dtype);
     at::Tensor cmp_kv = std::get<0>(output);
 
     auto state_cache_dim = state_cache.dim();
@@ -3321,6 +3329,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         ") -> Tensor"
         );
     ops.impl("compressor", torch::kPrivateUse1, &vllm_ascend::compressor);
+    ops.def(
+        "compressor_from_projected("
+            "Tensor x, Tensor wkv, Tensor wgate, "
+            "Tensor(a!) state_cache, Tensor ape, Tensor norm_weight, "
+            "Tensor rope_sin, Tensor rope_cos, "
+            "Tensor? state_block_table, Tensor? cu_seqlens, "
+            "Tensor? seqused, Tensor? start_pos, "
+            "int rope_head_dim, int cmp_ratio, int coff, "
+            "float norm_eps, int rotary_mode, int cache_mode"
+        ") -> Tensor"
+    );
+    ops.impl("compressor_from_projected", torch::kPrivateUse1, &vllm_ascend::compressor);
 
     ops.def(
         "compressor_metadata("

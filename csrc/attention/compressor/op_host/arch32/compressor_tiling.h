@@ -108,7 +108,7 @@ static const std::string CMP_KV_NAME = "cmp_kv";
 static std::string DataTypeToSerialString(ge::DataType type);
 
 const std::map<std::string, std::vector<ge::DataType>> DTYPE_SUPPORT_MAP = {
-    {X_NAME,                  {ge::DT_BF16, ge::DT_FLOAT16}},
+    {X_NAME,                  {ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT}},
     {WKV_NAME,                {ge::DT_BF16, ge::DT_FLOAT16}},
     {WGATE_NAME,              {ge::DT_BF16, ge::DT_FLOAT16}},
     {STATE_CACHE_NAME,        {ge::DT_FLOAT}},

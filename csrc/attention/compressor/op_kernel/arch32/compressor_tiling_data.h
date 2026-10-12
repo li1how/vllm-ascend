@@ -33,6 +33,7 @@ namespace optiling {
 
     // 1. 基础参数结构体
     struct CompressorBaseParams {
+        uint32_t projectedInput = 0;
         uint32_t batchSize = 0;             // bastch size（批大小）
         uint32_t seqSize = 0;               // sequence size（kvs大小）
         uint32_t hiddenSize = 0;            // hidden size（隐藏层大小）

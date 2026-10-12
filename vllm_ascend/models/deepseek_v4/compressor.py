@@ -190,18 +190,51 @@ class Compressor(nn.Module):
 
         return get_or_compute_compressor_metadata(metadata, self.compress_ratio, self.vllm_config)
 
+    def project(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project rank-local tokens without rounding the Cube output to BF16."""
+        if hidden_states.dtype != torch.bfloat16 or self.wkv.weight.dtype != torch.bfloat16:
+            raise ValueError("PCP compressor projection requires BF16 inputs and weights")
+        width = self.coff * self.head_dim
+        if hidden_states.shape[0] == 0:
+            return hidden_states.new_empty((0, 2 * width), dtype=torch.float32)
+        kv = torch.mm(hidden_states, self.wkv.weight.t(), out_dtype=torch.float32)
+        scores = torch.mm(hidden_states, self.wgate.weight.t(), out_dtype=torch.float32)
+        return torch.cat((kv, scores), dim=-1)
+
+    def forward_projected(
+        self,
+        projected: torch.Tensor,
+        state_cache: torch.Tensor,
+        metadata: AscendCompressorMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the existing A3 Vector compression on restored FP32 projections."""
+        if projected.dtype != torch.float32 or projected.shape[-1] != 2 * self.coff * self.head_dim:
+            raise ValueError("Expected FP32 [tokens, KV width + score width] projections")
+        return self._forward(projected.contiguous(), state_cache, metadata, projected_input=True)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         state_cache: torch.Tensor,
         metadata: AscendCompressorMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._forward(hidden_states, state_cache, metadata, projected_input=False)
+
+    def _forward(
+        self,
+        hidden_states: torch.Tensor,
+        state_cache: torch.Tensor,
+        metadata: AscendCompressorMetadata,
+        *,
+        projected_input: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         compressor_metadata = metadata.cache.req_metadata
         state_metadata = metadata.state.req_metadata
         assert compressor_metadata is not None
         assert state_metadata is not None
         compress_cos, compress_sin, slot_mapping = self._compute_metadata(compressor_metadata)
-        compressed_kv = torch.ops._C_ascend.compressor(
+        op = torch.ops._C_ascend.compressor_from_projected if projected_input else torch.ops._C_ascend.compressor
+        compressed_kv = op(
             hidden_states,
             self.wkv.weight,
             self.wgate.weight,
