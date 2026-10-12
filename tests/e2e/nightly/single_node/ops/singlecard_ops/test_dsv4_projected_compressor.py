@@ -29,8 +29,16 @@ def test_compressor_from_projected_matches_hidden_chunks(ratio, width, coff):
     # A3 cache block size 128 uses C4 state blocks of 8 and C128 blocks of 32.
     state_block_size = 8 if ratio == 4 else 32
     pages_per_request = 1024 // state_block_size
-    state_a = torch.zeros((1 + 4 * pages_per_request, state_block_size, 2 * coff * width), device="npu")
-    state_b = state_a.clone()
+    pages = 1 + 4 * pages_per_request
+    state_width = 2 * coff * width
+    # Match A3's padded state pages, including the Indexer's 256-byte tail.
+    page_elements = (16640 if ratio == 4 and width == 128 else 131072) // 4
+    storage_a = torch.zeros((pages, page_elements), device="npu")
+    storage_b = storage_a.clone()
+    state_shape = (pages, state_block_size, state_width)
+    state_strides = (page_elements, state_width, 1)
+    state_a = storage_a.as_strided(state_shape, state_strides)
+    state_b = storage_b.as_strided(state_shape, state_strides)
     table = torch.arange(1, 1 + 4 * pages_per_request, dtype=torch.int32, device="npu").view(4, pages_per_request)
     cache_table = torch.arange(1, 9, dtype=torch.int32, device="npu").view(4, 2)
     angles = torch.linspace(0, 1, 1024 * 64, device="npu").view(1024, 64)
@@ -116,6 +124,6 @@ def test_compressor_from_projected_matches_hidden_chunks(ratio, width, coff):
         )
         torch.npu.synchronize()
         valid = sum((start + length) // ratio - start // ratio for start, length in zip(starts, lengths))
-        torch.testing.assert_close(state_a, state_b, rtol=3e-4, atol=3e-4)
+        torch.testing.assert_close(storage_a, storage_b, rtol=3e-4, atol=3e-4)
         torch.testing.assert_close(reference[:valid].float(), candidate[:valid].float(), rtol=0.02, atol=0.03)
         starts = [start + length for start, length in zip(starts, lengths)]
