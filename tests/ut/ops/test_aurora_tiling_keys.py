@@ -139,10 +139,10 @@ class AuroraTilingKeysTest(unittest.TestCase):
                         rows.append((name, line.split("{", 1)[1].split("}", 1)[0]))
                 self.assertEqual(len(rows), 14)
                 expected = {
-                    "x": "ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT",
-                    "wkv": "ge::DT_BF16, ge::DT_FLOAT16, ge::DT_BF16",
-                    "wgate": "ge::DT_BF16, ge::DT_FLOAT16, ge::DT_BF16",
-                    "cmp_kv": "ge::DT_BF16, ge::DT_FLOAT16, ge::DT_BF16",
+                    "x": "ge::DT_BF16, ge::DT_FLOAT16",
+                    "wkv": "ge::DT_BF16, ge::DT_FLOAT16",
+                    "wgate": "ge::DT_BF16, ge::DT_FLOAT16",
+                    "cmp_kv": "ge::DT_BF16, ge::DT_FLOAT16",
                     "state_cache": "ge::DT_FLOAT",
                     "ape": "ge::DT_FLOAT",
                     "norm_weight": "ge::DT_FLOAT",
@@ -158,6 +158,7 @@ class AuroraTilingKeysTest(unittest.TestCase):
                 host = (root / arch / "compressor_tiling.h").read_text()
                 host_expected = expected.copy()
                 if arch == "arch32":
+                    host_expected["x"] = "ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT"
                     for name in ("wkv", "wgate", "cmp_kv"):
                         host_expected[name] = "ge::DT_BF16, ge::DT_FLOAT16"
                 if arch == "arch35":

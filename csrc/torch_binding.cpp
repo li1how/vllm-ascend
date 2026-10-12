@@ -1009,9 +1009,15 @@ std::tuple<at::Tensor> compressor(const at::Tensor &x, const at::Tensor &wkv, co
     // }
     int64_t state_cache_stride_dim0 = state_cache.stride(0);
 
-    EXEC_NPU_CMD(aclnnCompressor, x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos,
+    if (x.scalar_type() == at::kFloat) {
+        EXEC_NPU_CMD(aclnnCompressorFromProjected, x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos,
                     state_block_table, cu_seqlens, seqused, start_pos, rope_head_dim, cmp_ratio, coff, norm_eps,
                     rotary_mode, cache_mode, state_cache_stride_dim0, cmp_kv);
+    } else {
+        EXEC_NPU_CMD(aclnnCompressor, x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos,
+                    state_block_table, cu_seqlens, seqused, start_pos, rope_head_dim, cmp_ratio, coff, norm_eps,
+                    rotary_mode, cache_mode, state_cache_stride_dim0, cmp_kv);
+    }
 
     return std::tuple<at::Tensor>(cmp_kv);
 }
