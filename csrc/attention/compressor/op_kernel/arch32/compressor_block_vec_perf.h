@@ -366,8 +366,10 @@ __aicore__ inline void CompressorBlockVectorPerf<COMP>::CopyProjectedToWorkspace
     uint32_t rows = min(rowsPerSubBlock, info.dealSeqCnt - firstRow);
     uint32_t width = static_cast<uint32_t>(COMP::coff) * constInfo_.headDim;
     uint64_t token = tools_.GetTIdxByBatch(info.bStart) + info.sStart + firstRow;
-    // InitVec1GlobalTensor already receives the workspace base of this group.
-    uint64_t outputBase = info.cubeDbIdx * constInfo_.dbSize + firstRow * width + constInfo_.dIdx;
+    // Vector readers receive Vec1InputKvGm/Vec1InputScoreGm at the global base,
+    // whereas Cube writers receive a base already offset to their core group.
+    uint64_t outputBase = info.cubeDbIdx * constInfo_.dbSize +
+                          constInfo_.curGroupIdx * constInfo_.mm1KvResSize + firstRow * width + constInfo_.dIdx;
     LocalTensor<T> buffer = inputQue1.AllocTensor<T>();
     for (uint32_t score = 0; score < 2; ++score) {
         for (uint32_t part = 0; part < static_cast<uint32_t>(COMP::coff); ++part) {
