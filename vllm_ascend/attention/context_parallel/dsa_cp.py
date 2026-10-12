@@ -2574,7 +2574,9 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
         # cache-update work for the auxiliary stream to overlap.
         self.multistream_dsv4_dsa_overlap = False
         self.pcp_cache_projection_mode = get_ascend_config().pcp_cache_projection_mode
-        if self.pcp_cache_projection_mode != "hidden" and is_950():
+        if self.pcp_cache_projection_mode != "hidden" and not get_current_hardware_profile().supports(
+            HardwareCapability.DSV4_PROJECTED_COMPRESSOR
+        ):
             raise ValueError("PCP cache projection currently supports the A3 Compressor only")
         self.enable_pcp_o_proj_weight_sharding = enable_pcp_o_proj_weight_sharding()
         self._pcp_o_proj_weight_switches = None

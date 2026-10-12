@@ -80,6 +80,8 @@ class HardwareCapability(Enum):
     DSA_C128_STATE_SMALL_BLOCK_SIZES = auto()
     # Use the DeepSeek-V4/DSA compressed-KV-cache layout and compressor/indexer flow.
     DSV4_COMPRESSED_CACHE = auto()
+    # Compress globally gathered FP32 projections with the packaged A3 kernel.
+    DSV4_PROJECTED_COMPRESSOR = auto()
     # Use the DeepSeek-V4.1 mixed-quant cache and packaged QLI/QSMLA ABI.
     DSV41_PACKED_CACHE = auto()
     # Triton RMS/dot/gate/residual fusion for unrotated Engram inputs.
@@ -279,6 +281,7 @@ _STANDARD_CAPABILITIES = frozenset(
     }
 )
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
+    HardwareCapability.DSV4_PROJECTED_COMPRESSOR,
     HardwareCapability.GMM_DEQUANT_SITU_QUANT,
     HardwareCapability.MC2_FULLMESH_V2_COMM,
     HardwareCapability.RMS_NORM_CAST,

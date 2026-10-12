@@ -162,6 +162,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "copy_and_expand_eagle_inputs"
         "lightning_indexer_quant"
         "compressor"
+        "compressor_from_projected"
         "compressor_metadata"
         "quant_lightning_indexer_v2"
         "quant_lightning_indexer_v2_metadata"
