@@ -148,10 +148,16 @@ class EngramModelState(AscendModelState):
             self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]],
             0,
         ).astype(np.int32)
-        self._replay_start.np[:num_reqs] = replay_np
-        self._replay_start.copy_to_gpu(num_reqs)
-        replay_start = self._replay_start.gpu[:num_reqs]
-        if replay_window > 0 and replay_np.any() and cacheable_groups.numel() > 0:
+        # A zero replay boundary leaves the ordinary SWA window unchanged.
+        # Do not publish it during decode (including FULL capture), or every
+        # SWA builder expands request indices and rebuilds the same no-op mask.
+        has_replay = bool(replay_np.any())
+        replay_start = None
+        if has_replay:
+            self._replay_start.np[:num_reqs] = replay_np
+            self._replay_start.copy_to_gpu(num_reqs)
+            replay_start = self._replay_start.gpu[:num_reqs]
+        if replay_window > 0 and has_replay and cacheable_groups.numel() > 0:
             _pad_v2_replayed_slots_kernel[(num_reqs,)](
                 slot_mappings,
                 slot_mappings.stride(0),
@@ -164,7 +170,7 @@ class EngramModelState(AscendModelState):
                 NUM_GROUPS=cacheable_groups.numel(),
                 BLOCK=1024,
             )
-        if model_specific_attn_metadata is None:
+        if model_specific_attn_metadata is None and replay_start is not None:
             model_specific_attn_metadata = ReplayAttnMetadata(replay_start)
         return super().prepare_attn(
             input_batch,

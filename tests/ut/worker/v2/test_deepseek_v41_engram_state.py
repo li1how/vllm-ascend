@@ -5,8 +5,10 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
 from vllm_ascend.models.deepseek_v41.engram import model_state as deepseek_v41
@@ -139,3 +141,46 @@ def test_eager_hook_forwards_lookup_events(state):
     assert result["engram_pending"] is events
     state.prepare_engram()
     state.model.prepare_engram_inputs.assert_called_once()
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_decode_omits_inactive_replay_metadata(state, monkeypatch, for_capture):
+    parent = Mock(return_value={})
+    monkeypatch.setattr(AscendModelState, "prepare_attn", parent)
+    state._replay_groups = (128, torch.tensor([0], dtype=torch.int32))
+    state._replay_start_np[2] = 17  # A previous prefill must not leak into decode.
+    copy = Mock()
+    monkeypatch.setattr(state._replay_start, "copy_to_gpu", copy)
+    current = batch()
+    current.is_prefilling_np = np.array([False, False])
+    current.idx_mapping_np = np.array([2, 0])
+    state.prepare_attn(current, CUDAGraphMode.FULL, (), torch.zeros(1, 8), [], None, for_capture=for_capture)
+    assert parent.call_args.kwargs["model_specific_attn_metadata"] is None
+    copy.assert_not_called()
+
+
+@pytest.mark.parametrize("replay_boundary", [0, 17])
+def test_prefill_keeps_only_active_replay_boundaries(state, monkeypatch, replay_boundary):
+    parent = Mock(return_value={})
+    monkeypatch.setattr(AscendModelState, "prepare_attn", parent)
+    state._replay_groups = (128, torch.tensor([0], dtype=torch.int32))
+    state._replay_start_np[2] = replay_boundary
+    copy = Mock(side_effect=lambda n: state._replay_start.gpu[:n].copy_(torch.from_numpy(state._replay_start.np[:n])))
+    monkeypatch.setattr(state._replay_start, "copy_to_gpu", copy)
+    launch = Mock()
+    kernel = Mock()
+    kernel.__getitem__ = Mock(return_value=launch)
+    monkeypatch.setattr(deepseek_v41, "_pad_v2_replayed_slots_kernel", kernel)
+    current = batch()
+    current.is_prefilling_np = np.array([True, False])
+    current.idx_mapping_np = np.array([2, 0])
+    state.prepare_attn(current, CUDAGraphMode.NONE, (), torch.zeros(1, 8), [], None)
+    metadata = parent.call_args.kwargs["model_specific_attn_metadata"]
+    if replay_boundary:
+        copy.assert_called_once_with(2)
+        launch.assert_called_once()
+        torch.testing.assert_close(metadata.replay_start, torch.tensor([17, 0], dtype=torch.int32))
+    else:
+        assert metadata is None
+        copy.assert_not_called()
+        launch.assert_not_called()
