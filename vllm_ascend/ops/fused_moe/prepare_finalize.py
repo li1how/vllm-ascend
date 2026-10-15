@@ -273,7 +273,8 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         self.replace_allreduce = replace_allreduce
         mc2_mask = _EXTRA_CTX.mc2_mask
         is_padding = get_forward_context().is_padding
-        if is_padding is not None:
+        # TP > 1 can already carry an SP-local mask; keep its existing path.
+        if self.tp_size == 1 and is_padding is not None:
             # MRV2's graph bucket includes empty PCP ranks. Consume the live
             # device mask inside the model graph instead of treating the bucket
             # size as an actual token count. Keep this output independent of the

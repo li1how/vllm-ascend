@@ -117,6 +117,9 @@ class TestPrepareAndFinalize(unittest.TestCase):
                     layer = PrepareAndFinalizeWithMC2(self.moe_config)
                     local = hidden[rank * shard_size : (rank + 1) * shard_size]
                     logits = local[:, :2].clone()
+                    self.forward_context.is_padding = (
+                        torch.arange(rank * shard_size, (rank + 1) * shard_size) >= num_tokens
+                    )
                     prepared = layer.prepare(local, logits, replace_allreduce=True)
                     expected_mask = torch.zeros(padded_num_tokens // 4, dtype=torch.bool)
                     expected_mask[:shard_size] = torch.arange(rank * shard_size, (rank + 1) * shard_size) < num_tokens
