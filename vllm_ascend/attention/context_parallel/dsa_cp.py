@@ -2373,6 +2373,35 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         )
 
     @staticmethod
+    def _build_shared_graph_common(
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        num_actual_reqs: int | None,
+        batch_shared: dict[Any, Any],
+    ) -> AscendCommonAttentionMetadata:
+        # Cache query offsets only; block tables and slots belong to each
+        # physical cache group. The dictionary is recreated for every batch.
+        build = AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata
+        if num_actual_reqs is None or common_attn_metadata.num_reqs <= num_actual_reqs:
+            return build(common_attn_metadata, num_actual_reqs)
+        if common_attn_metadata.is_prefilling is not None and bool(common_attn_metadata.is_prefilling.any()):
+            return build(common_attn_metadata, num_actual_reqs)
+        query = common_attn_metadata.query_start_loc
+        key = (
+            query.data_ptr(),
+            query.stride(),
+            common_attn_metadata.num_reqs,
+            common_attn_metadata.num_input_tokens,
+            num_actual_reqs,
+        )
+        offsets = batch_shared.setdefault("pcp_graph_query_offsets", {})
+        views = offsets.get(key)
+        if views is None:
+            prepared = build(common_attn_metadata, num_actual_reqs)
+            views = (prepared.query_start_loc, prepared.query_start_loc_cpu)
+            offsets[key] = views
+        return common_attn_metadata.replace(query_start_loc=views[0], query_start_loc_cpu=views[1])
+
+    @staticmethod
     def _build_global_common_attn_metadata(
         pcp_context: "AscendPCPAttentionContext",
         cache_group_idx: int,
@@ -2494,9 +2523,10 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
                 pcp_cache_group_idx,
                 common_attn_metadata,
             )
-            global_common_attn_metadata = self._build_graph_common_attn_metadata(
+            global_common_attn_metadata = self._build_shared_graph_common(
                 global_common_attn_metadata,
                 pcp_context.global_batch.num_reqs,
+                common_ratio_to_sas_metadata,
             )
             # num_prefills can miss short prefills; prevent local PCP RoPE
             # from overwriting the global RoPE buffer. Sharded decode also
@@ -2506,7 +2536,9 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
                 global_common_attn_metadata,
                 fast_build,
                 num_actual_reqs=pcp_context.global_batch.num_reqs,
-                common_ratio_to_sas_metadata={},
+                # Global positions/sequence lengths are common to every
+                # group, but differ from the rank-local query metadata.
+                common_ratio_to_sas_metadata=common_ratio_to_sas_metadata.setdefault("pcp_global", {}),
                 can_use_rope_cache=False,
                 full_graph_mode=full_graph_mode,
             )
@@ -2530,9 +2562,10 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         if local_common_attn_metadata.num_actual_tokens == 0:
             # The placeholder request of an empty rank is graph padding too.
             num_actual_reqs = 0
-        local_common_attn_metadata = self._build_graph_common_attn_metadata(
+        local_common_attn_metadata = self._build_shared_graph_common(
             local_common_attn_metadata,
             num_actual_reqs,
+            common_ratio_to_sas_metadata,
         )
         local_dsa_metadata = self._build_local_dsa_metadata(
             common_prefix_len,

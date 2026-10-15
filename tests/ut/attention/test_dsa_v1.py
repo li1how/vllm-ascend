@@ -2217,6 +2217,8 @@ def test_pcp_metadata_builds_global_view_when_batch_has_prefill():
         build=MagicMock(return_value=global_metadata),
     )
 
+    global_shared = {"sentinel": object()}
+    shared = {"local": True, "pcp_global": global_shared}
     with patch.object(
         AscendDSAMetadataBuilder,
         "build",
@@ -2228,7 +2230,7 @@ def test_pcp_metadata_builds_global_view_when_batch_has_prefill():
             common_attn_metadata,
             pcp_context=pcp_context,
             pcp_cache_group_idx=1,
-            common_ratio_to_sas_metadata={"local": True},
+            common_ratio_to_sas_metadata=shared,
             num_actual_reqs=2,
         )
 
@@ -2253,7 +2255,8 @@ def test_pcp_metadata_builds_global_view_when_batch_has_prefill():
     assert global_common.attn_state is global_batch.attn_state
     assert global_call.kwargs["num_actual_reqs"] == global_batch.num_reqs
     assert global_call.kwargs["can_use_rope_cache"] is False
-    assert global_call.kwargs["common_ratio_to_sas_metadata"] == {}
+    assert global_call.kwargs["common_ratio_to_sas_metadata"] is global_shared
+    assert build_local.call_args.kwargs["common_ratio_to_sas_metadata"] is shared
     assert build_local.call_args.args[2] is local_common
     assert build_local.call_args.kwargs["num_actual_reqs"] == 2
 

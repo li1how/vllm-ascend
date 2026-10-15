@@ -49,6 +49,47 @@ class TestAscendDSACPLayerMetadata:
 
 
 class TestAscendDSAPCPGraphPadding:
+    @pytest.mark.parametrize("query_len", [1, 2])
+    @pytest.mark.parametrize("actual_reqs", [0, 1, 2])
+    def test_graph_offsets_shared_only_within_same_batch_layout(self, query_len, actual_reqs):
+        class Common(SimpleNamespace):
+            def replace(self, **kwargs):
+                return Common(**(vars(self) | kwargs))
+
+        query = torch.arange(5, dtype=torch.int32).clamp(max=actual_reqs) * query_len
+        common = Common(
+            num_reqs=4,
+            num_input_tokens=4 * query_len,
+            is_prefilling=torch.zeros(4, dtype=torch.bool),
+            query_start_loc=query,
+            query_start_loc_cpu=query.clone(),
+            block_table_tensor=torch.tensor([[1]]),
+            slot_mapping=torch.tensor([128]),
+        )
+        other = common.replace(block_table_tensor=torch.tensor([[2]]), slot_mapping=torch.tensor([256]))
+        builder = AscendDSAPCPMetadataBuilder
+        shared = {}
+        with patch.object(
+            builder, "_build_graph_common_attn_metadata", wraps=builder._build_graph_common_attn_metadata
+        ) as prepare:
+            first = builder._build_shared_graph_common(common, actual_reqs, shared)
+            second = builder._build_shared_graph_common(other, actual_reqs, shared)
+            assert prepare.call_count == 1
+            assert first.query_start_loc is second.query_start_loc
+            assert first.query_start_loc_cpu is second.query_start_loc_cpu
+            assert second.block_table_tensor is other.block_table_tensor
+            assert second.slot_mapping is other.slot_mapping
+            torch.testing.assert_close(first.query_start_loc, torch.arange(5, dtype=torch.int32) * query_len)
+            # Positions are refreshed each step even when graph addresses stay fixed.
+            query[actual_reqs + 1 :].fill_(actual_reqs * query_len)
+            refreshed = builder._build_shared_graph_common(common, actual_reqs, {})
+            assert prepare.call_count == 2
+            torch.testing.assert_close(refreshed.query_start_loc, torch.arange(5, dtype=torch.int32) * query_len)
+            # Global and local layouts can have equal lengths and different addresses.
+            separate = common.replace(query_start_loc=query.clone())
+            builder._build_shared_graph_common(separate, actual_reqs, shared)
+            assert prepare.call_count == 3
+
     @pytest.mark.parametrize(
         "full_graph_mode,expected_num_tokens",
         [
