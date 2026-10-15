@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -22,6 +23,13 @@ class TestPrepareAndFinalize(unittest.TestCase):
         mock_config_utils = self.mock_get_config_utils.start()
         mock_config_utils.return_value = mock_ascend_config
         self.addCleanup(self.mock_get_config_utils.stop)
+        self.forward_context = SimpleNamespace(is_padding=None)
+        forward_context_patch = patch(
+            "vllm_ascend.ops.fused_moe.prepare_finalize.get_forward_context",
+            return_value=self.forward_context,
+        )
+        forward_context_patch.start()
+        self.addCleanup(forward_context_patch.stop)
         self.moe_config = MagicMock(spec=FusedMoEConfig)
         self.moe_config.tp_group = MagicMock()
         self.moe_config.tp_group.device_group = MagicMock()
@@ -69,6 +77,26 @@ class TestPrepareAndFinalize(unittest.TestCase):
         # Finalize
         result = layer.finalize(h_out, reduce_results=False, padded_hidden_states_shape=padded_hidden_states_shape)
         self.assertEqual(result.shape[0], 3)
+
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=1)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_mc2_uses_live_padding_without_aliasing_platform_mask(self, mock_context, mock_rank, mock_size):
+        context = SimpleNamespace(mc2_mask=torch.ones(4, dtype=torch.bool), padded_num_tokens=4)
+        mock_context.return_value = context
+        layer = PrepareAndFinalizeWithMC2(self.moe_config)
+        self.forward_context.is_padding = torch.tensor([False, True, False])
+        hidden, logits = torch.randn(3, 8), torch.randn(3, 2)
+        prepared = layer.prepare(hidden, logits)
+        torch.testing.assert_close(prepared.mc2_mask, torch.tensor([True, False, True, False]))
+        context.mc2_mask.fill_(False)
+        torch.testing.assert_close(prepared.mc2_mask, torch.tensor([True, False, True, False]))
+        self.forward_context.is_padding.fill_(True)
+        empty = layer.prepare(hidden, logits)
+        assert not empty.mc2_mask.any()
+        self.forward_context.is_padding.fill_(False)
+        active = layer.prepare(hidden, logits)
+        torch.testing.assert_close(active.mc2_mask, torch.tensor([True, True, True, False]))
 
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=4)
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank")
