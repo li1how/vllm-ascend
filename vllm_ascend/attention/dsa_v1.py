@@ -851,6 +851,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         *,
         can_use_rope_cache: bool = True,
         full_graph_mode: bool = False,
+        cache_update_only: bool = False,
         **kwargs,
     ) -> AscendDSAMetadata:
         num_reqs = common_attn_metadata.num_reqs
@@ -928,6 +929,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cos=cos,
             sin=sin,
             full_graph_mode=full_graph_mode,
+            cache_update_only=cache_update_only,
         )
 
         return self.metadata_cls(  # type: ignore
@@ -1090,6 +1092,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cos: torch.Tensor,
         sin: torch.Tensor,
         full_graph_mode: bool = False,
+        cache_update_only: bool = False,
     ) -> AscendDSAReqMetadata:
         assert self.common_ratio_to_sas_metadata is not None
         metadata_cache = self.common_ratio_to_sas_metadata
@@ -1198,7 +1201,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 mm_prefix_ranges=mm_ranges,
                 num_tokens=self.num_actual_tokens,
             )
-        if not has_prefill and self.common_ratio_to_sas_metadata.get(layer_name) is None:
+        if not cache_update_only and not has_prefill and self.common_ratio_to_sas_metadata.get(layer_name) is None:
             cu_seqlens_ori_kv = DeviceOperator.get_dsa_decode_cu_seqlens_ori_kv(
                 self.common_ratio_to_sas_metadata,
                 "cu_seqlens_ori_kv",
@@ -1211,7 +1214,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         elif has_prefill:
             cu_seqlens_ori_kv = query_start_loc
 
-        if self._device_metadata_enabled:
+        if cache_update_only:
+            # PCP's global view only updates replicated caches. Attention and
+            # query selection consume the separate rank-local metadata view.
+            self._device_metadata_tasks = ()
+            sas_metadata = None
+            qli_metadata = None
+        elif self._device_metadata_enabled:
 
             def build_sas_metadata() -> None:
                 self._build_sas_metadata(
@@ -1292,7 +1301,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         qli_cu_seqlens_q = None
         qli_seqused_k = None
         qli_cmp_residual_k = None
-        if self.compressor_ratio == 4:
+        if self.compressor_ratio == 4 and not cache_update_only:
             # QLI v2 PA_BBND reads the compressed K length plus the residual
             # from the original length; the persistent builder buffers are
             # refreshed in _build_qli_metadata.

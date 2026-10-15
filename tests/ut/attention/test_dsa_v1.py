@@ -416,6 +416,64 @@ def test_build_req_metadata_defers_device_work_to_fixed_buffers(
         builder._build_qli_metadata.assert_not_called()
 
 
+@pytest.mark.parametrize("compressor_ratio", [1, 4, 128])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("has_prefill", [False, True])
+def test_cache_update_only_metadata_preserves_cache_inputs(compressor_ratio, deferred, has_prefill):
+    builder = _make_builder(compressor_ratio)
+    if deferred:
+        builder.enable_device_metadata()
+    builder.num_actual_tokens = 2
+    builder.num_prefills = int(has_prefill)
+    builder.block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_input_tokens=2,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        causal=True,
+    )
+    builder._build_sas_metadata = MagicMock()
+    builder._build_qli_metadata = MagicMock()
+    cos, sin = torch.ones(2), torch.zeros(2)
+    with (
+        patch("vllm_ascend.attention.dsa_v1.get_full_cos_and_sin_dsa", return_value=(cos, sin)),
+        patch.object(DeviceOperator, "get_dsa_decode_cu_seqlens_ori_kv") as ori_offsets,
+        patch.object(DeviceOperator, "get_dsa_decode_cu_seqlens_cmp_kv") as cmp_offsets,
+    ):
+        metadata = builder.build_req_metadata(
+            common_attn_metadata=common,
+            seq_lens_cpu=builder.seq_lens,
+            num_actual_reqs=2,
+            cos=cos,
+            sin=sin,
+            cache_update_only=True,
+        )
+    builder._build_sas_metadata.assert_not_called()
+    builder._build_qli_metadata.assert_not_called()
+    ori_offsets.assert_not_called()
+    cmp_offsets.assert_not_called()
+    assert metadata.sas_metadata is None and metadata.qli_metadata is None
+    assert metadata.qli_seqused_k is None and metadata.qli_cmp_residual_k is None
+    assert metadata.cos is cos and metadata.sin is sin
+    assert torch.equal(metadata.start_pos, builder.seq_lens - 1)
+    assert torch.equal(metadata.block_table, builder.block_table)
+    tasks = builder.take_device_metadata_tasks()
+    if deferred and compressor_ratio > 1:
+        assert [task.stage for task in tasks] == [DeviceMetadataStage.COMPRESSOR]
+        assert metadata.compressor_metadata is not None
+        with patch("vllm_ascend.attention.dsa_v1.build_compressor_metadata_out") as build_compressor:
+            tasks[0].run()
+        build_compressor.assert_called_once()
+    else:
+        assert tasks == ()
+    if compressor_ratio == 1:
+        assert metadata.slot_mapping.data_ptr() == builder.slot_mapping.data_ptr()
+    else:
+        assert metadata.full_compress_cos is cos and metadata.full_compress_sin is sin
+
+
 def test_full_graph_compressor_metadata_uses_capture_bucket_extent():
     builder = _make_builder(4)
     builder.enable_device_metadata()
@@ -2255,6 +2313,7 @@ def test_pcp_metadata_builds_global_view_when_batch_has_prefill():
     assert global_common.attn_state is global_batch.attn_state
     assert global_call.kwargs["num_actual_reqs"] == global_batch.num_reqs
     assert global_call.kwargs["can_use_rope_cache"] is False
+    assert global_call.kwargs["cache_update_only"] is True
     assert global_call.kwargs["common_ratio_to_sas_metadata"] is global_shared
     assert build_local.call_args.kwargs["common_ratio_to_sas_metadata"] is shared
     assert build_local.call_args.args[2] is local_common

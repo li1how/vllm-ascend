@@ -2541,6 +2541,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
                 common_ratio_to_sas_metadata=common_ratio_to_sas_metadata.setdefault("pcp_global", {}),
                 can_use_rope_cache=False,
                 full_graph_mode=full_graph_mode,
+                cache_update_only=True,
             )
             if (
                 not has_prefill
