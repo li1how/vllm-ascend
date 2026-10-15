@@ -2491,7 +2491,7 @@ def test_pcp_graph_metadata_restores_mtp_query_offsets():
     assert torch.equal(replace_kwargs["query_start_loc_cpu"], expected_query_start_loc)
 
 
-@pytest.mark.parametrize("local_num_actual_tokens", [2, 0], ids=["local_tokens", "empty_rank"])
+@pytest.mark.parametrize("local_num_actual_tokens", [4, 2, 0], ids=["full_bucket", "local_tokens", "empty_rank"])
 @pytest.mark.parametrize("shard_o_proj", [False, True])
 @pytest.mark.parametrize("global_prefill,decode_sharded", [(True, False), (True, True), (False, True)])
 def test_pcp_forward_updates_global_caches_before_local_attention(
