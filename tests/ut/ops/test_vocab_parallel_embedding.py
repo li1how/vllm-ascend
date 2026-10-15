@@ -429,6 +429,8 @@ def test_embedding_exchange_rejects_invalid_batch_before_communication(monkeypat
 
 
 def test_compiled_embedding_exchange_keeps_capacity_buffers_outside_graph(monkeypatch):
+    from torch._dynamo.backends.common import aot_autograd
+
     layer, weight = _exchange_embedding(monkeypatch, VocabParallelMode.PCP_X_TP)
     context = ForwardContext({layer.layer_name: layer}, {}, {})
     graphs = []
@@ -448,9 +450,10 @@ def test_compiled_embedding_exchange_keeps_capacity_buffers_outside_graph(monkey
 
     # CPU execution exercises the real opaque implementation; Dynamo must see
     # only the custom op, without lifting capacity-sized buffers into the graph.
-    with torch.library.Library("vllm", "IMPL", "CPU") as library:
+    library = torch.library.Library("vllm", "IMPL", "CPU")
+    try:
         library.impl("embedding_token_exchange", embedding_token_exchange)
-        compiled = torch.compile(layer, backend=compiler, fullgraph=True, dynamic=True)
+        compiled = torch.compile(layer, backend=aot_autograd(fw_compiler=compiler), fullgraph=True, dynamic=True)
         with override_forward_context(context):
             first = compiled(torch.tensor([1, 2]))
             saved = first.clone()
@@ -460,10 +463,12 @@ def test_compiled_embedding_exchange_keeps_capacity_buffers_outside_graph(monkey
         torch.testing.assert_close(first, saved)
         torch.testing.assert_close(second, weight[torch.tensor([3])])
         assert empty.shape == (0, layer.embedding_dim)
+    finally:
+        library._destroy()
     assert graphs
     for graph in graphs:
         calls = [node.target for node in graph.graph.nodes if node.op == "call_function"]
-        assert calls == [torch.ops.vllm.embedding_token_exchange]
+        assert calls == [torch.ops.vllm.embedding_token_exchange.default]
         assert len([node for node in graph.graph.nodes if node.op == "placeholder"]) <= 2
 
 
