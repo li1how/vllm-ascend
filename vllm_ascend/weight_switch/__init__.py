@@ -15,6 +15,7 @@ from .linear import (
 from .o_proj import (
     OProjWeightSwitchMixin,
 )
+from .parallel_o_proj import OProjectionMode, ParallelOProjection
 
 __all__ = [
     "WeightLoadPartition",
@@ -27,4 +28,6 @@ __all__ = [
     "WeightSwitchRepeatSpec",
     "WeightSwitchState",
     "OProjWeightSwitchMixin",
+    "OProjectionMode",
+    "ParallelOProjection",
 ]
