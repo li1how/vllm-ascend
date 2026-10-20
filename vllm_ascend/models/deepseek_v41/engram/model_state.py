@@ -168,11 +168,16 @@ class EngramModelState(AscendModelState):
             self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]],
             0,
         ).astype(np.int32)
-        self._replay_start.np[:metadata_num_reqs].fill(0)
-        self._replay_start.np[:num_reqs] = replay_np
-        self._replay_start.copy_to_gpu(metadata_num_reqs)
-        replay_start = self._replay_start.gpu[:metadata_num_reqs]
-        if replay_window > 0 and replay_np.any() and cacheable_groups.numel() > 0:
+        has_replay = bool(replay_np.any())
+        replay_start = None
+        # Decoder replay consumes the zero boundaries too. Otherwise an idle
+        # prefix-replay buffer has no consumer and needs no host/device upload.
+        if has_replay or self.decoder_replay_state is not None:
+            self._replay_start.np[:metadata_num_reqs].fill(0)
+            self._replay_start.np[:num_reqs] = replay_np
+            self._replay_start.copy_to_gpu(metadata_num_reqs)
+            replay_start = self._replay_start.gpu[:metadata_num_reqs]
+        if replay_window > 0 and has_replay and cacheable_groups.numel() > 0:
             _pad_v2_replayed_slots_kernel[(num_reqs,)](
                 slot_mappings,
                 slot_mappings.stride(0),
@@ -190,7 +195,7 @@ class EngramModelState(AscendModelState):
         # the optional ori_topk_length input changes the graph attention path
         # even when every boundary is zero. Real replay steps still carry the
         # padded, graph-shaped buffer above.
-        if model_specific_attn_metadata is None and replay_np.any():
+        if model_specific_attn_metadata is None and has_replay:
             model_specific_attn_metadata = ReplayAttnMetadata(replay_start)
         attn_metadata = super().prepare_attn(
             input_batch,
@@ -204,6 +209,7 @@ class EngramModelState(AscendModelState):
             model_specific_attn_metadata=model_specific_attn_metadata,
         )
         if self.decoder_replay_state is not None:
+            assert replay_start is not None
             self.decoder_replay_state.prepare(
                 DecoderReplayInputs(input_batch, block_tables, slot_mappings, attn_groups, replay_start),
                 cudagraph_mode,

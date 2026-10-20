@@ -183,15 +183,18 @@ def test_replay_metadata_follows_local_segments_and_preserves_global_history(sta
     assert state.lookback_token_ids.shape == (4, 3)
 
 
-def test_full_graph_replay_metadata_is_padded_and_inactive_without_replay(monkeypatch):
+@pytest.mark.parametrize("decoder_replay", [False, True])
+def test_full_graph_replay_metadata_is_padded_and_inactive_without_replay(monkeypatch, decoder_replay):
     """FULL graph metadata must cover padded rows and skip inactive replay."""
 
     class Buffer:
         def __init__(self, size):
             self.np = np.zeros(size, dtype=np.int32)
-            self.gpu = torch.zeros(size, dtype=torch.int32)
+            self.gpu = torch.full((size,), -1, dtype=torch.int32)
+            self.copies = 0
 
         def copy_to_gpu(self, count):
+            self.copies += 1
             self.gpu[:count].copy_(torch.from_numpy(self.np[:count]))
 
     captured = {}
@@ -206,7 +209,7 @@ def test_full_graph_replay_metadata_is_padded_and_inactive_without_replay(monkey
     state._replay_groups = (128, torch.empty(0, dtype=torch.int32))
     state._replay_start_np = np.zeros(4, dtype=np.int32)
     state._replay_start = Buffer(8)
-    state.decoder_replay_state = None
+    state.decoder_replay_state = Mock() if decoder_replay else None
 
     batch = SimpleNamespace(
         num_reqs=1,
@@ -224,5 +227,12 @@ def test_full_graph_replay_metadata_is_padded_and_inactive_without_replay(monkey
     )
 
     assert state._replay_start.gpu.shape == (8,)
-    assert torch.count_nonzero(state._replay_start.gpu) == 0
+    if decoder_replay:
+        assert state._replay_start.copies == 1
+        assert torch.count_nonzero(state._replay_start.gpu) == 0
+        inputs = state.decoder_replay_state.prepare.call_args.args[0]
+        torch.testing.assert_close(inputs.encoder_replay_start, torch.zeros(8, dtype=torch.int32))
+    else:
+        assert state._replay_start.copies == 0
+        assert torch.all(state._replay_start.gpu == -1)
     assert captured["model_specific_attn_metadata"] is None
