@@ -30,6 +30,7 @@ from vllm_ascend.ops.vocab_parallel_embedding import (
     AscendVocabParallelEmbedding,
     VocabParallelMode,
     _resolve_vocab_parallel_plan,
+    embedding_token_exchange,
 )
 
 VOCAB_PARALLEL_EMBEDDING_TEST_NUM_RANDOM_SEEDS = 128
@@ -315,6 +316,7 @@ def _exchange_embedding(monkeypatch, mode, tp_rank=0, tp_size=1, exchange_rank=0
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(prefill_context_parallel_size=2 if mode is VocabParallelMode.PCP_X_TP else 1),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        compilation_config=SimpleNamespace(static_forward_context={}),
     )
     for name, value in (
         ("get_tp_group", tp_group),
@@ -424,6 +426,50 @@ def test_embedding_exchange_rejects_invalid_batch_before_communication(monkeypat
     ):
         layer(torch.ones(num_tokens, dtype=torch.long))
     gather.assert_not_called()
+
+
+def test_compiled_embedding_exchange_keeps_capacity_buffers_outside_graph(monkeypatch):
+    from torch._dynamo.backends.common import aot_autograd
+
+    layer, weight = _exchange_embedding(monkeypatch, VocabParallelMode.PCP_X_TP)
+    context = ForwardContext({layer.layer_name: layer}, {}, {})
+    graphs = []
+
+    def gather(output, input_, *, group):
+        output.copy_(input_.repeat(2))
+
+    def scatter(output, input_, *, group):
+        output.copy_(input_[: output.shape[0]])
+
+    monkeypatch.setattr("vllm_ascend.ops.vocab_parallel_embedding.dist.all_gather_into_tensor", gather)
+    monkeypatch.setattr("vllm_ascend.ops.vocab_parallel_embedding.dist.reduce_scatter_tensor", scatter)
+
+    def compiler(graph, inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    # CPU execution exercises the real opaque implementation; Dynamo must see
+    # only the custom op, without lifting capacity-sized buffers into the graph.
+    library = torch.library.Library("vllm", "IMPL", "CPU")
+    try:
+        library.impl("embedding_token_exchange", embedding_token_exchange)
+        compiled = torch.compile(layer, backend=aot_autograd(fw_compiler=compiler), fullgraph=True, dynamic=True)
+        with override_forward_context(context):
+            first = compiled(torch.tensor([1, 2]))
+            saved = first.clone()
+            second = compiled(torch.tensor([3]))
+            empty = compiled(torch.empty(0, dtype=torch.long))
+        torch.testing.assert_close(first, weight[torch.tensor([1, 2])])
+        torch.testing.assert_close(first, saved)
+        torch.testing.assert_close(second, weight[torch.tensor([3])])
+        assert empty.shape == (0, layer.embedding_dim)
+    finally:
+        library._destroy()
+    assert graphs
+    for graph in graphs:
+        calls = [node.target for node in graph.graph.nodes if node.op == "call_function"]
+        assert calls == [torch.ops.vllm.embedding_token_exchange.default]
+        assert len([node for node in graph.graph.nodes if node.op == "placeholder"]) <= 2
 
 
 class TestVocabParallelPlan(unittest.TestCase):

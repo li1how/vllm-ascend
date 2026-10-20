@@ -26,7 +26,7 @@ from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
 from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
-from vllm.forward_context import is_forward_context_available
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -41,6 +41,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     pad_vocab_size,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.distributed.parallel_state import (
     GroupCoordinator,
@@ -159,6 +160,30 @@ def _resolve_vocab_parallel_plan(
     )
 
 
+def embedding_token_exchange(
+    input_: torch.Tensor, layer_name: str, embedding_dim: int, dtype: torch.dtype
+) -> torch.Tensor:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    # Keep persistent collective buffers outside AOT functionalization. Returning
+    # fresh storage also prevents a later lookup from overwriting this output.
+    return layer._forward_with_token_exchange(input_).clone()
+
+
+def embedding_token_exchange_fake(
+    input_: torch.Tensor, layer_name: str, embedding_dim: int, dtype: torch.dtype
+) -> torch.Tensor:
+    return input_.new_empty((input_.shape[0], embedding_dim), dtype=dtype)
+
+
+direct_register_custom_op(
+    op_name="embedding_token_exchange",
+    op_func=embedding_token_exchange,
+    mutates_args=[],
+    fake_impl=embedding_token_exchange_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
 class AscendVocabParallelEmbedding(VocabParallelEmbedding):
     """
     Register VocabParallelEmbedding as a custom op for Ascend.
@@ -196,6 +221,11 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         self.tp_size = plan.shard_world_size
 
         if self.token_exchange_group is not None:
+            self.layer_name = prefix
+            compilation_config = get_current_vllm_config().compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
             self.embedding_tp_capacity = max(
                 get_potential_max_tokens(),
                 get_current_vllm_config().scheduler_config.max_num_batched_tokens,
@@ -300,6 +330,10 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
 
     def forward(self, input_):
         if self.token_exchange_group is not None:
+            if torch.compiler.is_compiling():
+                return torch.ops.vllm.embedding_token_exchange(
+                    input_, self.layer_name, self.embedding_dim, self.params_dtype
+                )
             return self._forward_with_token_exchange(input_)
         return self._forward_standard(input_)
 
