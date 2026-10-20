@@ -351,6 +351,25 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
             cos_views[layer_name], sin_views[layer_name] = views
         return cos_views, sin_views
 
+    @staticmethod
+    def _build_shared_graph_common(common, num_actual_reqs, batch_shared):
+        # Cache only query offsets. Physical tables and slot mappings belong
+        # to individual cache groups and must never be shared here.
+        build = AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata
+        if batch_shared is None or num_actual_reqs is None:
+            return build(common, num_actual_reqs)
+        if common.is_prefilling is not None and bool(common.is_prefilling.any()):
+            return build(common, num_actual_reqs)
+        query = common.query_start_loc
+        key = (query.data_ptr(), query.stride(), common.num_reqs, common.num_input_tokens, num_actual_reqs)
+        offsets = batch_shared.setdefault("pcp_graph_query_offsets", {})
+        views = offsets.get(key)
+        if views is None:
+            prepared = build(common, num_actual_reqs)
+            views = (prepared.query_start_loc, prepared.query_start_loc_cpu)
+            offsets[key] = views
+        return common.replace(query_start_loc=views[0], query_start_loc_cpu=views[1])
+
     def _build_empty_local_metadata(self, common: AscendCommonAttentionMetadata) -> AscendDSAV41Metadata:
         # Skip SMLA/QLI metadata ops on ranks with no queries.
         self._device_metadata_tasks = ()
@@ -415,10 +434,11 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
 
         # Match graph capture shapes; dummy batches must not advance the C2 ring.
         if kwargs.get("full_graph_mode", False):
-            local_common = AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata(local_common, num_actual_reqs)
+            batch_shared = kwargs.get("common_v41_batch_metadata")
+            local_common = self._build_shared_graph_common(local_common, num_actual_reqs, batch_shared)
             if needs_global_metadata:
-                global_common = AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata(
-                    global_common, pcp_context.global_batch.num_reqs
+                global_common = self._build_shared_graph_common(
+                    global_common, pcp_context.global_batch.num_reqs, batch_shared
                 )
         kwargs["skip_ring_state_update"] = (
             bool(kwargs.get("skip_ring_state_update", False)) or pcp_context.global_batch.is_dummy

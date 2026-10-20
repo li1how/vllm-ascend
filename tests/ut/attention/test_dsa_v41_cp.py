@@ -448,6 +448,32 @@ class TestLegacyMetadata:
 
 
 class TestPCPMetadata:
+    def test_graph_offsets_shared_without_sharing_cache_group_tables(self, builders, monkeypatch):
+        builder = builders()["swa"]
+        common = _batch(2, 1, "decode").local
+        other_table = common.block_table_tensor.clone().add_(1)
+        other_slots = common.slot_mapping.clone().add_(128)
+        other = common.replace(block_table_tensor=other_table, slot_mapping=other_slots)
+        prepare = Mock(wraps=dsa_cp.AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata)
+        monkeypatch.setattr(dsa_cp.AscendDSAPCPMetadataBuilder, "_build_graph_common_attn_metadata", prepare)
+        shared = {}
+        first = builder._build_shared_graph_common(common, 1, shared)
+        second = builder._build_shared_graph_common(other, 1, shared)
+        assert prepare.call_count == 1
+        assert first.query_start_loc is second.query_start_loc
+        assert first.query_start_loc_cpu is second.query_start_loc_cpu
+        assert second.block_table_tensor is other_table
+        assert second.slot_mapping is other_slots
+        torch.testing.assert_close(first.query_start_loc, torch.arange(0, 25, 6, dtype=torch.int32))
+        # A new step restores the offsets again; the cache cannot survive it.
+        common.query_start_loc[2:].fill_(6)
+        refreshed = builder._build_shared_graph_common(common, 1, {})
+        assert prepare.call_count == 2
+        torch.testing.assert_close(refreshed.query_start_loc, torch.arange(0, 25, 6, dtype=torch.int32))
+        # Different actual request counts must not reuse an earlier result.
+        builder._build_shared_graph_common(common, 2, shared)
+        assert prepare.call_count == 3
+
     @pytest.mark.parametrize("graph_width", [1, 8])
     @pytest.mark.parametrize("packed_cache", [False, True])
     def test_empty_rank_disables_captured_query_tasks(self, builders, graph_width, packed_cache):
